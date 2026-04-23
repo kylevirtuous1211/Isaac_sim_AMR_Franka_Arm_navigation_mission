@@ -58,6 +58,13 @@ try:
         state.nav_generation = getattr(state, "nav_generation", 0) + 1
         log(f"nav_generation bumped → {state.nav_generation} (stale loops will exit)")
 
+        # Clear the navigator's reached-latch so a fresh set_goal() can
+        # drive again. Otherwise, after reaching the goal once, the latch
+        # would stay True and every subsequent step() would zero the wheels.
+        if hasattr(state.navigator, "_reached_latch"):
+            state.navigator._reached_latch = False
+            log("navigator._reached_latch cleared")
+
         world = state.world
         await world.reset_async()
         state.manipulator.reset()
