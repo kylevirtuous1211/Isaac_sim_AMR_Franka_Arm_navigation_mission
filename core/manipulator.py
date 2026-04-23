@@ -110,15 +110,44 @@ def _world_pose_of(prim_path: str) -> tuple[np.ndarray, np.ndarray]:
     )
 
 
+def _make_base_kinematic(franka_prim_path: str, base_link: str = "panda_link0") -> bool:
+    """Mark Franka's base rigid body as kinematic.
+
+    Kinematic bodies:
+      - Are NOT simulated dynamically (gravity / forces don't affect them)
+      - CAN be teleported via set_world_pose without destabilizing physics
+      - Still provide collision and constraint anchors for dynamic children
+
+    This is what makes per-tick pose-sync stable: the base just obeys our
+    teleport; the arm's dynamic links (panda_link1..7 + fingers) remain
+    dynamic, so RMPflow torque control still drives them normally.
+    """
+    import omni.usd
+    from pxr import UsdPhysics
+    stage = omni.usd.get_context().get_stage()
+    base_path = f"{franka_prim_path}/{base_link}"
+    prim = stage.GetPrimAtPath(base_path)
+    if not prim or not prim.IsValid():
+        print(f"[manipulator] base link not found at {base_path}")
+        return False
+    # UsdPhysics.RigidBodyAPI is typically already applied by the Franka USD;
+    # we just flip kinematicEnabled=True.
+    rb = UsdPhysics.RigidBodyAPI(prim)
+    if not rb:
+        rb = UsdPhysics.RigidBodyAPI.Apply(prim)
+    rb.CreateKinematicEnabledAttr(True).Set(True)
+    print(f"[manipulator] {base_path}: kinematicEnabled = True")
+    return True
+
+
 def _install_pose_sync(world, franka: Franka, mount_prim: str,
                       local_offset: np.ndarray, cb_name: str) -> None:
     """Install a physics callback that teleports Franka's base to
     mount_prim.world_pose() + local_offset every tick.
 
-    This creates a 'rigid attachment' effect without PhysX joints:
-    Franka moves with the AMR but stays a separate articulation, so
-    its arm motion (RMPflow / PickPlace) still works and the AMR
-    wheels aren't affected.
+    Prereq: Franka's base must be kinematic (see _make_base_kinematic).
+    Otherwise teleporting a dynamic body creates spurious forces and
+    destabilizes both robots.
     """
     # Remove any prior callback with this name (re-setup idempotency)
     try:
@@ -131,7 +160,6 @@ def _install_pose_sync(world, franka: Franka, mount_prim: str,
     def _sync(_step_size):
         try:
             mount_pos, mount_rot = _world_pose_of(mount_prim)
-            # Rotate local_offset by mount's orientation
             rotated = _rotate_by_quat(offset, mount_rot)
             franka.set_world_pose(
                 position=mount_pos + rotated,
@@ -295,15 +323,18 @@ class FrankaRMPflowManipulator(Manipulator):
         self._grasp_hold_ticks = int(cfg.get("grasp_hold_ticks", 40))
         self._release_hold_ticks = int(cfg.get("release_hold_ticks", 30))
 
-        # Mobile-manipulation mount — Franka base follows a moving prim
-        # (e.g. Nova Carter chassis) via a per-tick pose teleport.
+        # Mobile-manipulation mount — Franka is fixed-base by default,
+        # so set_world_pose() cleanly teleports the whole articulation.
+        # The pose-sync callback drives that every tick so Franka rides
+        # on top of the moving chassis. Collision with the chassis is
+        # avoided by picking an offset taller than the chassis height.
         mount_to = cfg.get("mount_to")
         if mount_to:
             _install_pose_sync(
                 world,
                 self.franka,
                 mount_prim=mount_to,
-                local_offset=np.array(cfg.get("mount_local_offset", [0.0, 0.0, 0.30]),
+                local_offset=np.array(cfg.get("mount_local_offset", [0.0, 0.0, 0.50]),
                                       dtype=float),
                 cb_name=cfg.get("mount_sync_name", "franka_base_sync"),
             )

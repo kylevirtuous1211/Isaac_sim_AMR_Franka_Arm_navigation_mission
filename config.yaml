@@ -54,21 +54,19 @@ manipulator:
   prim_path: "/World/Franka"
   name: "franka"
 
-  # 'Arm station' mode — Franka parked next to the cube (Point A is
-  # at (2, 1, 0)). The AMR drives UP TO this station for pick/place.
-  # Station is placed off-center so it doesn't overlap the AMR's start
-  # position or collide with its spawn.
-  position: [2.0, -0.5, 0.0]
+  # --- Mobile-manipulation mount ---
+  # Franka's base (panda_link0) is flipped to KINEMATIC, then a
+  # physics callback teleports it to chassis_link + local_offset
+  # every tick. Kinematic bodies accept teleports cleanly (no
+  # spurious forces), so the arm follows the AMR rigidly without
+  # destabilizing either robot's physics. Arm joints stay dynamic
+  # so RMPflow still drives them normally for pick/place.
+  mount_to: "/World/NovaCarter/chassis_link"
+  mount_local_offset: [0.0, 0.0, 0.50]     # 50 cm — above chassis height, avoids collision
+  mount_sync_name: "franka_base_sync"      # physics callback name
 
-  # --- Mobile-manipulation mount (disabled) ---
-  # Teleporting an articulation root every tick destabilizes PhysX
-  # because the dynamic arm links can't cope with the sudden base
-  # motion. A proper fix requires making panda_link0 kinematic (via
-  # PhysxRigidBodyAPI) OR using PhysX's attachment constraint API.
-  # Leaving the config shape here so the code path stays documented.
-  # mount_to: "/World/NovaCarter/chassis_link"
-  # mount_local_offset: [0.0, 0.0, 0.30]
-  # mount_sync_name: "franka_base_sync"
+  # Fallback 'arm station' mode (swap with the block above):
+  # position: [2.0, -0.5, 0.0]
   clearance_height: 0.15
   approach_tolerance: 0.04
   grasp_hold_ticks: 40
