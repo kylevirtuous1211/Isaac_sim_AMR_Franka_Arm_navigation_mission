@@ -201,6 +201,7 @@ class FrankaPickPlaceManipulator(Manipulator):
         self._target_pick = None
         self._target_place = None
         self._action = Action.NONE
+        self._done_latch = False
 
     def setup(self, world, cfg: dict) -> None:
         from isaacsim.robot.manipulators.examples.franka.controllers import (
@@ -220,13 +221,54 @@ class FrankaPickPlaceManipulator(Manipulator):
         self._target_pick = np.asarray(xyz, dtype=float)
         self._target_place = None
         self._action = Action.PICK
+        self._done_latch = False
         self.ctrl.reset()
+
+    def rebase(self, world_position, world_orientation=None) -> None:
+        """Move the Franka articulation to a new base pose and rebuild the
+        PickPlaceController so its IK solver uses the new root frame.
+
+        Use when the Franka is riding on an AMR that has just arrived at
+        a pickup/drop-off point: teleport Franka to AMR's current pose,
+        then `rebase(new_pos)` so the controller plans from the new frame.
+        """
+        if self.franka is None or self.ctrl is None:
+            return
+        ori = world_orientation
+        if ori is None:
+            ori = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
+        # Update the visual/physx xform
+        self.franka.set_world_pose(position=np.asarray(world_position, dtype=float),
+                                   orientation=np.asarray(ori, dtype=float))
+        # Update the articulation's default (post_reset) pose so the
+        # controller's kinematic reference moves with it
+        try:
+            self.franka.set_default_state(
+                position=np.asarray(world_position, dtype=float),
+                orientation=np.asarray(ori, dtype=float),
+            )
+        except Exception as e:
+            print(f"[FrankaPickPlace] set_default_state failed: {e}")
+
+        # Rebuild the controller so its internal reference pose is fresh
+        from isaacsim.robot.manipulators.examples.franka.controllers import (
+            PickPlaceController,
+        )
+        self.ctrl = PickPlaceController(
+            name="pick_place_controller",
+            gripper=self.franka.gripper,
+            robot_articulation=self.franka,
+            events_dt=self.cfg.get("events_dt"),
+        )
+        self._done_latch = False
+        print(f"[FrankaPickPlace] rebased to {list(world_position)}")
 
     def place(self, xyz) -> None:
         # PickPlaceController is a single fused pick→place cycle.
         # To use place() alone, call pick(current_cube_pos) + place(target).
         self._target_place = np.asarray(xyz, dtype=float)
         self._action = Action.PLACE
+        self._done_latch = False
 
     def add_obstacle(self, prim_path: str) -> None:
         print(f"[FrankaPickPlace] add_obstacle ignored (no avoidance): {prim_path}")
@@ -234,6 +276,8 @@ class FrankaPickPlaceManipulator(Manipulator):
     def step(self) -> ManipStatus:
         if self._action == Action.NONE:
             return ManipStatus.IDLE
+        if self._done_latch:
+            return ManipStatus.DONE
         if self._target_pick is None or self._target_place is None:
             return ManipStatus.RUNNING
         joints = self.franka.get_joint_positions()
@@ -245,19 +289,36 @@ class FrankaPickPlaceManipulator(Manipulator):
         self.franka.apply_action(actions)
         if self.ctrl.is_done():
             self._action = Action.NONE
+            self._done_latch = True
             return ManipStatus.DONE
         return ManipStatus.RUNNING
+
+    def get_phase(self) -> str:
+        """For symmetry with RMPflow. PickPlaceController is event-driven
+        internally; return a coarse state indicator."""
+        if self._done_latch:
+            return "done"
+        if self._action == Action.NONE:
+            return "idle"
+        return "running"
+
+    def is_done(self) -> bool:
+        return self._done_latch
 
     def reset(self) -> None:
         if self.ctrl is not None:
             self.ctrl.reset()
         if self.franka is not None:
-            self.franka.gripper.set_joint_positions(
-                self.franka.gripper.joint_opened_positions
-            )
+            try:
+                self.franka.gripper.set_joint_positions(
+                    self.franka.gripper.joint_opened_positions
+                )
+            except Exception as e:
+                print(f"[FrankaPickPlace] gripper open failed: {e}")
         self._action = Action.NONE
         self._target_pick = None
         self._target_place = None
+        self._done_latch = False
 
 
 # ────────────────────────────────────────────────────────────────
@@ -322,6 +383,7 @@ class FrankaRMPflowManipulator(Manipulator):
         self._approach_tol = float(cfg.get("approach_tolerance", 0.03))
         self._grasp_hold_ticks = int(cfg.get("grasp_hold_ticks", 40))
         self._release_hold_ticks = int(cfg.get("release_hold_ticks", 30))
+        self._phase_timeout_ticks = int(cfg.get("phase_timeout_ticks", 800))
 
         # Mobile-manipulation mount — Franka is fixed-base by default,
         # so set_world_pose() cleanly teleports the whole articulation.
@@ -373,12 +435,29 @@ class FrankaRMPflowManipulator(Manipulator):
 
     # ── per-tick ─────────────────────────────────────────────
     def step(self) -> ManipStatus:
-        if self._phase in ("idle", "done"):
-            return ManipStatus.IDLE if self._phase == "idle" else ManipStatus.DONE
+        if self._phase in ("idle", "done", "failed"):
+            if self._phase == "done":
+                return ManipStatus.DONE
+            if self._phase == "failed":
+                return ManipStatus.FAILED
+            return ManipStatus.IDLE
 
         target = self._phase_target()
         if target is None:
             return ManipStatus.FAILED
+
+        # Keep RMPflow's internal base frame in sync with the ACTUAL Franka
+        # base pose. Required when the arm is mounted on a moving AMR (the
+        # pose-sync callback teleports panda_link0 every tick; if RMPflow
+        # still thinks the base is at (0, 0, 0) it plans into the floor).
+        try:
+            base_pos, base_ori = self.franka.get_world_pose()
+            self.rmp.set_robot_base_pose(
+                robot_position=np.asarray(base_pos, dtype=float),
+                robot_orientation=np.asarray(base_ori, dtype=float),
+            )
+        except Exception as e:
+            print(f"[FrankaRMPflow] set_robot_base_pose failed: {e}")
 
         self.rmp.set_end_effector_target(target_position=target)
         self.rmp.update_world()
@@ -389,9 +468,24 @@ class FrankaRMPflowManipulator(Manipulator):
         ee_pos = self._ee_position()
         dist = float(np.linalg.norm(ee_pos - target))
         self._tick_in_phase += 1
-        self._advance_phase_if_done(dist)
 
+        # Phase-level timeout: if we've spent more than N ticks in the same
+        # phase without advancing, something is stuck (RMPflow target
+        # unreachable, base pose stale, gripper fight, etc.) — bail out.
+        if self._tick_in_phase > self._phase_timeout_ticks:
+            print(f"[FrankaRMPflow] phase '{self._phase}' timed out after "
+                  f"{self._tick_in_phase} ticks (dist_to_target={dist:.3f})")
+            self._phase = "failed"
+            return ManipStatus.FAILED
+
+        self._advance_phase_if_done(dist)
         return ManipStatus.DONE if self._phase == "done" else ManipStatus.RUNNING
+
+    def get_phase(self) -> str:
+        return self._phase
+
+    def is_done(self) -> bool:
+        return self._phase == "done"
 
     def reset(self) -> None:
         self._phase = "idle"

@@ -50,27 +50,37 @@ navigator:
 
 # ── Arm manipulator ───────────────────────────────────────────
 manipulator:
-  type: franka_rmpflow
+  type: franka_pickplace           # franka_rmpflow for RMPflow-based obstacle avoidance
   prim_path: "/World/Franka"
   name: "franka"
 
-  # --- Mobile-manipulation mount ---
-  # Franka's base (panda_link0) is flipped to KINEMATIC, then a
-  # physics callback teleports it to chassis_link + local_offset
-  # every tick. Kinematic bodies accept teleports cleanly (no
-  # spurious forces), so the arm follows the AMR rigidly without
-  # destabilizing either robot's physics. Arm joints stay dynamic
-  # so RMPflow still drives them normally for pick/place.
-  mount_to: "/World/NovaCarter/chassis_link"
-  mount_local_offset: [0.0, 0.0, 0.50]     # 50 cm — above chassis height, avoids collision
-  mount_sync_name: "franka_base_sync"      # physics callback name
+  # --- 'Arm station' mode ---
+  # Franka is parked at a FIXED world position near the cube pickup.
+  # The AMR drives to a handoff pose, then Franka (standing at its
+  # station) picks the cube and places it at point_b.
+  #
+  # Why not mobile-manip (mount_to) for pick/place:
+  # Isaac Sim's PickPlaceController + RMPflow assume a stable
+  # articulation root at its spawn position. Teleporting the Franka
+  # via `franka.set_world_pose()` each tick updates the USD xform
+  # but not the PhysX articulation base frame — IK then plans from
+  # the original spawn position (here, where the AMR started), so
+  # target reaches to (2, 1, ...) resolve to out-of-range poses
+  # (>2 m from spawn). Parking Franka at the cube fixes this.
+  position: [1.5, 1.0, 0.0]                # next to cube at Point A
 
-  # Fallback 'arm station' mode (swap with the block above):
-  # position: [2.0, -0.5, 0.0]
-  clearance_height: 0.15
-  approach_tolerance: 0.04
-  grasp_hold_ticks: 40
-  release_hold_ticks: 30
+  # --- Disabled: mobile-manipulation mount (see note above) ---
+  # mount_to: "/World/NovaCarter/chassis_link"
+  # mount_local_offset: [0.0, 0.0, 0.50]
+  # mount_sync_name: "franka_base_sync"
+  # --- Pick & place tunables ---
+  clearance_height: 0.15            # meters above pick/place target for approach/lift
+  approach_tolerance: 0.04          # end-effector within this distance = phase done
+  grasp_hold_ticks: 40              # how long to hold the grip after closing
+  release_hold_ticks: 30            # how long to wait after opening before retract
+  phase_timeout_ticks: 800          # abort a phase after this many stuck ticks
+  pick_z_offset: 0.0                # extra Z added to pick target (positive = higher grip)
+  place_z_offset: 0.03              # drop-from-height: release this far above target
   rmpflow_config: "/workspace/configs/rmpflow/franka_rmpflow_common.yaml"
   rmpflow: {}                       # override robot_description_path / urdf_path here
 
