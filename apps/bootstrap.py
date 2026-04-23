@@ -43,8 +43,31 @@ try:
         state.teardown()
 
     if state.is_ready() and not force:
+        # Fast-reset path: scene + robots already spawned, just restore poses.
+        # world.reset_async() returns every articulation to its default pose
+        # (the positions we passed to Navigator/Manipulator.setup). We also
+        # re-open the gripper and re-play the sim.
         log(state.summary())
-        log("Bootstrap skipped — state already populated.")
+        log("State already populated — fast-reset instead of full reload.")
+        world = state.world
+        await world.reset_async()
+        state.manipulator.reset()
+        await world.play_async()
+
+        # Re-aim camera behind the reset AMR position.
+        from isaacsim.core.utils.viewports import set_camera_view
+        import numpy as np
+        start_pos = state.navigator.get_pose()[0]
+        set_camera_view(
+            eye=start_pos + np.array([-2.5, 0.0, 1.8]),
+            target=start_pos + np.array([1.0, 0.0, 0.6]),
+        )
+        log("Scene reset to defaults (fast path — no stage reload).")
+        # Give physics a few ticks to settle
+        import omni.kit.app
+        for _ in range(30):
+            await omni.kit.app.get_app().next_update_async()
+        log(f"AMR pose after reset: {state.navigator.get_pose()[0].tolist()}")
     else:
         # ── 1. Hospital stage ────────────────────────────────
         # Always reload the stage here: if state is NOT populated but a
