@@ -63,6 +63,7 @@ class WaypointNavigator(Navigator):
         self._waypoints: list[np.ndarray] = []
         self._idx: int = 0
         self._goal: np.ndarray | None = None
+        self._reached_latch: bool = False  # once REACHED, stay REACHED until next set_goal
 
         # Blockage detection state
         self._last_pos: np.ndarray | None = None
@@ -128,6 +129,7 @@ class WaypointNavigator(Navigator):
         self._idx = 0
         self._stuck_counter = 0
         self._replans_used = 0
+        self._reached_latch = False
         self.ctrl.reset()
 
         if not self._waypoints:
@@ -145,9 +147,19 @@ class WaypointNavigator(Navigator):
         pos, ori = self.get_pose()
         pos_xy = pos[:2]
 
+        # Latch: once we've reported REACHED, stop driving and stay reached
+        # until the next set_goal(). Prevents overshoot from re-engaging the
+        # controller — without this, any drift past reach_tol flips us back
+        # to RUNNING and the AMR orbits the goal forever.
+        if self._reached_latch:
+            self._zero_wheels()
+            return NavStatus.REACHED
+
         # Are we done?
         if self._idx >= len(self._waypoints):
             if float(np.linalg.norm(pos_xy - self._goal)) < self._reach_tol:
+                self._reached_latch = True
+                self._zero_wheels()
                 return NavStatus.REACHED
             self._idx = len(self._waypoints) - 1  # re-aim at final
 
@@ -158,7 +170,10 @@ class WaypointNavigator(Navigator):
             self._idx += 1
             self.ctrl.reset()
             if self._idx >= len(self._waypoints):
-                return NavStatus.RUNNING  # next tick will trigger reached check
+                # Final waypoint reached — latch REACHED now, don't wait a tick.
+                self._reached_latch = True
+                self._zero_wheels()
+                return NavStatus.REACHED
             target = self._waypoints[self._idx]
 
         # Blockage — stuck detection
@@ -231,7 +246,12 @@ class WaypointNavigator(Navigator):
         return self.robot.get_world_pose()
 
     def stop(self) -> None:
-        """Zero out wheel velocities."""
+        """External API: zero wheels AND latch REACHED (idempotent shutdown)."""
+        self._reached_latch = True
+        self._zero_wheels()
+
+    def _zero_wheels(self) -> None:
+        """Command wheel velocities = 0. Safe to call every tick."""
         if self.robot is None:
             return
         try:
@@ -244,4 +264,4 @@ class WaypointNavigator(Navigator):
             )
             self.robot.apply_action(action)
         except Exception as e:
-            print(f"[Navigator] stop() failed: {e}")
+            print(f"[Navigator] _zero_wheels failed: {e}")
