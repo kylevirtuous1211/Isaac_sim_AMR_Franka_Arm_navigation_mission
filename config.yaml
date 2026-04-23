@@ -41,9 +41,9 @@ navigator:
     wheel_dof_names: ["joint_wheel_left", "joint_wheel_right"]
     wheel_radius: 0.04
     wheel_base: 0.413
-  max_linear_speed: 0.5            # m/s
-  max_angular_speed: 1.0           # rad/s
-  waypoint_reach_threshold: 0.20   # meters — when a waypoint counts as reached
+  max_linear_speed: 0.35           # m/s — lower = less overshoot
+  max_angular_speed: 0.8           # rad/s
+  waypoint_reach_threshold: 0.35   # meters — AMR is ~0.5 m across; 0.35 gives ~1 body-length slack
   stuck_threshold_ticks: 240       # ticks of no motion before re-plan
   stuck_position_tolerance: 0.01   # meters — under this = "not moving"
   max_replans: 3
@@ -53,7 +53,12 @@ manipulator:
   type: franka_rmpflow
   prim_path: "/World/Franka"
   name: "franka"
-  position: [0.0, 0.0, 0.39]       # mounted on top of Nova Carter
+  # Parked at a fixed "arm station" away from the AMR's path. When we
+  # wire up true mobile-manipulation later we'll either (a) fix-joint
+  # the Franka to the Nova Carter chassis, or (b) have the AMR drive
+  # TO this station to hand off the cube. For now it must NOT overlap
+  # the AMR or it collides and jams the wheels.
+  position: [8.0, 0.0, 0.0]
   clearance_height: 0.15
   approach_tolerance: 0.04
   grasp_hold_ticks: 40

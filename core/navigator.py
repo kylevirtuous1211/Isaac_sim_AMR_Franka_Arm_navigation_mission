@@ -202,6 +202,14 @@ class WaypointNavigator(Navigator):
             return
         self._ensure_wheel_indices()
         action.joint_indices = np.array(self._wheel_indices, dtype=np.int32)
+        # Debug: every 100 calls, log what we're commanding
+        if not hasattr(self, "_dbg_n"):
+            self._dbg_n = 0
+        self._dbg_n += 1
+        if self._dbg_n % 100 == 1:
+            print(f"[Navigator] tick {self._dbg_n}: action.joint_velocities="
+                  f"{np.asarray(action.joint_velocities).tolist()} "
+                  f"joint_indices={action.joint_indices.tolist()}")
         self.robot.apply_action(action)
 
     def _handle_blockage(self) -> NavStatus:
