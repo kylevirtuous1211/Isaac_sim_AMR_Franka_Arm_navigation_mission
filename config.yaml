@@ -1,0 +1,85 @@
+# ============================================================
+# Midterm Project Configuration
+# All tunable variables in one place. Swap `type` fields to switch
+# concrete implementations without touching code.
+# ============================================================
+
+# ── Scene ─────────────────────────────────────────────────────
+scene:
+  usd_path: "/Isaac/Environments/Hospital/hospital.usd"
+
+# ── Global path planner ───────────────────────────────────────
+planner:
+  type: rrt_star              # registry key in core/factory.py (PLANNERS)
+  # Shared occupancy grid (used as the collision oracle).
+  # Raycast origin is HIGH above the scene so rays enter obstacles from
+  # outside — origin-inside-wall would give unreliable hits.
+  occupancy:
+    cell_size: 0.25                 # meters per cell (coarser = faster build)
+    raycast_z: 5.0                  # ray origin height (above indoor geometry)
+    obstacle_threshold: 0.15        # hit taller than this → occupied
+    bounds: [-15, 15, -15, 15]      # world XY bounds to sample
+  # RRT* tuning
+  rrt_star:
+    max_iter: 3000
+    step_size: 0.6
+    goal_bias: 0.15
+    rewire_radius: 1.5
+    goal_tolerance: 0.3
+    smooth: true
+    seed: null                # null = nondeterministic
+
+# ── AMR base navigator ────────────────────────────────────────
+navigator:
+  type: waypoint
+  robot:
+    usd_path: "/Isaac/Robots/NVIDIA/NovaCarter/nova_carter.usd"
+    prim_path: "/World/NovaCarter"
+    name: "nova_carter"
+    start_position: [0.0, 0.0, 0.0]
+    start_orientation: [1.0, 0.0, 0.0, 0.0]  # quaternion (w, x, y, z)
+    wheel_dof_names: ["joint_wheel_left", "joint_wheel_right"]
+    wheel_radius: 0.04
+    wheel_base: 0.413
+  max_linear_speed: 0.5            # m/s
+  max_angular_speed: 1.0           # rad/s
+  waypoint_reach_threshold: 0.20   # meters — when a waypoint counts as reached
+  stuck_threshold_ticks: 240       # ticks of no motion before re-plan
+  stuck_position_tolerance: 0.01   # meters — under this = "not moving"
+  max_replans: 3
+
+# ── Arm manipulator ───────────────────────────────────────────
+manipulator:
+  type: franka_rmpflow
+  prim_path: "/World/Franka"
+  name: "franka"
+  position: [0.0, 0.0, 0.39]       # mounted on top of Nova Carter
+  clearance_height: 0.15
+  approach_tolerance: 0.04
+  grasp_hold_ticks: 40
+  release_hold_ticks: 30
+  rmpflow_config: "/workspace/configs/rmpflow/franka_rmpflow_common.yaml"
+  rmpflow: {}                       # override robot_description_path / urdf_path here
+
+# ── Task (default fixed points — overridden by randomizer) ────
+task:
+  point_a: [2.0, 1.0, 0.0]         # pick location
+  point_b: [5.0, 3.0, 0.0]         # place location
+  cube_size: 0.0515                # 5.15 cm cube (Isaac Sim default)
+
+# ── Domain randomization (Section 4) ──────────────────────────
+randomization:
+  enabled: false                    # set true in 05_randomized_runs.py
+  seed: null
+  max_attempts: 100
+  min_separation: 0.5
+  cube_z: 0.025
+  start_bounds: [-1.0, 1.0, -1.0, 1.0]    # AMR start (x_min, x_max, y_min, y_max)
+  goal_bounds:  [3.0, 7.0, 1.0, 5.0]      # AMR goal
+  cube_bounds:  [1.5, 3.0, 0.5, 2.0]      # cube pick position
+  place_bounds: [4.0, 6.0, 2.0, 4.0]      # cube place position
+
+# ── Simulation ────────────────────────────────────────────────
+simulation:
+  max_ticks: 50000
+  physics_dt: null                  # null = use Isaac Sim default

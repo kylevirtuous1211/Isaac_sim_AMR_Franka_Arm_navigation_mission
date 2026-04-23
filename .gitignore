@@ -1,0 +1,30 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Editor
+.vscode/
+.idea/
+*.swp
+
+# Isaac Sim runtime
+/root/.nvidia-omniverse/
+*.log
+
+# Local diagnostic scripts (kept on disk, not committed)
+_inspect_*.py
+_set_camera.py
+_diag_*.py
+00_diagnose_paths.py
+
+# OS
+.DS_Store
+Thumbs.db
+
+# Generated screenshots / media
+*.png
+*.mp4
+*.jpg
