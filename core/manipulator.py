@@ -44,15 +44,19 @@ class Manipulator(ABC):
 
 
 # ────────────────────────────────────────────────────────────────
-# Shared helpers — spawn Franka, optionally bolt it to an AMR chassis
+# Shared helpers — spawn Franka, optionally carry it on an AMR chassis
 # ────────────────────────────────────────────────────────────────
 def _spawn_franka(world, cfg: dict) -> Franka:
     """Spawn Franka at a fixed world position.
 
-    If cfg["mount_to"] is set, we instead spawn the Franka at a position
-    derived from the mount body's current transform + mount_local_offset,
-    and then create a PhysX FixedJoint so the arm moves rigidly with the
-    mount (e.g. Nova Carter's chassis). See _rigid_mount() below.
+    If cfg["mount_to"] is set, we spawn the Franka above that prim and
+    install a per-tick pose-sync so the base follows it.
+
+    Why not a PhysX FixedJoint: linking two separate articulations
+    (Nova Carter + Franka) via FixedJoint causes PhysX to treat one of
+    them as rooted to world, jamming the wheels. The kinematic-sync
+    pattern avoids that by keeping the articulations independent and
+    just teleporting Franka's base every physics tick.
     """
     mount_to = cfg.get("mount_to")
     if mount_to:
@@ -69,21 +73,11 @@ def _spawn_franka(world, cfg: dict) -> Franka:
         position=position,
     )
     world.scene.add(franka)
-
-    if mount_to:
-        _rigid_mount(
-            body0_prim=mount_to,
-            body1_prim=cfg.get("prim_path", "/World/Franka"),
-            local_offset=np.array(cfg.get("mount_local_offset", [0.0, 0.0, 0.30]),
-                                  dtype=float),
-            joint_prim=cfg.get("mount_joint_prim", "/World/FrankaMount"),
-        )
     return franka
 
 
 def _world_pos_of(prim_path: str) -> np.ndarray:
-    """Return the world-space translation of a prim. Falls back to origin
-    if the prim isn't translated yet (e.g. sim not reset)."""
+    """Return the world-space translation of a prim."""
     import omni.usd
     from pxr import UsdGeom
     stage = omni.usd.get_context().get_stage()
@@ -97,32 +91,71 @@ def _world_pos_of(prim_path: str) -> np.ndarray:
     return np.array([t[0], t[1], t[2]], dtype=float)
 
 
-def _rigid_mount(body0_prim: str, body1_prim: str,
-                 local_offset: np.ndarray, joint_prim: str) -> None:
-    """Create a PhysX FixedJoint that rigidly attaches body1 to body0.
-
-    body0 is the anchor (AMR chassis), body1 is the follower (Franka base).
-    local_offset is the position of the Franka relative to body0's frame.
-    """
+def _world_pose_of(prim_path: str) -> tuple[np.ndarray, np.ndarray]:
+    """World-space (position, quaternion wxyz) of a prim."""
     import omni.usd
-    from pxr import UsdPhysics, Gf, Sdf
+    from pxr import UsdGeom, Gf
     stage = omni.usd.get_context().get_stage()
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim or not prim.IsValid():
+        return np.zeros(3), np.array([1.0, 0.0, 0.0, 0.0])
+    mat = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(0)
+    t = mat.ExtractTranslation()
+    rot = mat.ExtractRotationQuat()
+    w = rot.GetReal()
+    x, y, z = rot.GetImaginary()
+    return (
+        np.array([t[0], t[1], t[2]], dtype=float),
+        np.array([w, x, y, z], dtype=float),
+    )
 
-    if stage.GetPrimAtPath(joint_prim):
-        print(f"[manipulator] FixedJoint already exists at {joint_prim}; skipping")
-        return
 
-    joint = UsdPhysics.FixedJoint.Define(stage, Sdf.Path(joint_prim))
-    joint.CreateBody0Rel().SetTargets([Sdf.Path(body0_prim)])
-    joint.CreateBody1Rel().SetTargets([Sdf.Path(body1_prim)])
-    # body1 pose expressed in body0's frame
-    joint.CreateLocalPos0Attr().Set(Gf.Vec3f(float(local_offset[0]),
-                                             float(local_offset[1]),
-                                             float(local_offset[2])))
-    joint.CreateLocalRot0Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
-    joint.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
-    joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
-    print(f"[manipulator] FixedJoint: {body0_prim} -- offset={local_offset.tolist()} --> {body1_prim}")
+def _install_pose_sync(world, franka: Franka, mount_prim: str,
+                      local_offset: np.ndarray, cb_name: str) -> None:
+    """Install a physics callback that teleports Franka's base to
+    mount_prim.world_pose() + local_offset every tick.
+
+    This creates a 'rigid attachment' effect without PhysX joints:
+    Franka moves with the AMR but stays a separate articulation, so
+    its arm motion (RMPflow / PickPlace) still works and the AMR
+    wheels aren't affected.
+    """
+    # Remove any prior callback with this name (re-setup idempotency)
+    try:
+        world.remove_physics_callback(cb_name)
+    except Exception:
+        pass
+
+    offset = np.asarray(local_offset, dtype=float)
+
+    def _sync(_step_size):
+        try:
+            mount_pos, mount_rot = _world_pose_of(mount_prim)
+            # Rotate local_offset by mount's orientation
+            rotated = _rotate_by_quat(offset, mount_rot)
+            franka.set_world_pose(
+                position=mount_pos + rotated,
+                orientation=mount_rot,
+            )
+        except Exception as e:
+            print(f"[manipulator] pose-sync failed: {e}")
+
+    world.add_physics_callback(cb_name, callback_fn=_sync)
+    print(f"[manipulator] pose-sync installed: {mount_prim} + {offset.tolist()} → Franka base")
+
+
+def _rotate_by_quat(v: np.ndarray, q: np.ndarray) -> np.ndarray:
+    """Rotate a 3-vector by a quaternion (wxyz)."""
+    w, x, y, z = float(q[0]), float(q[1]), float(q[2]), float(q[3])
+    vx, vy, vz = float(v[0]), float(v[1]), float(v[2])
+    # q * v * q^-1, expanded
+    tx = 2 * (y * vz - z * vy)
+    ty = 2 * (z * vx - x * vz)
+    tz = 2 * (x * vy - y * vx)
+    rx = vx + w * tx + (y * tz - z * ty)
+    ry = vy + w * ty + (z * tx - x * tz)
+    rz = vz + w * tz + (x * ty - y * tx)
+    return np.array([rx, ry, rz], dtype=float)
 
 
 # ────────────────────────────────────────────────────────────────
@@ -261,6 +294,19 @@ class FrankaRMPflowManipulator(Manipulator):
         self._approach_tol = float(cfg.get("approach_tolerance", 0.03))
         self._grasp_hold_ticks = int(cfg.get("grasp_hold_ticks", 40))
         self._release_hold_ticks = int(cfg.get("release_hold_ticks", 30))
+
+        # Mobile-manipulation mount — Franka base follows a moving prim
+        # (e.g. Nova Carter chassis) via a per-tick pose teleport.
+        mount_to = cfg.get("mount_to")
+        if mount_to:
+            _install_pose_sync(
+                world,
+                self.franka,
+                mount_prim=mount_to,
+                local_offset=np.array(cfg.get("mount_local_offset", [0.0, 0.0, 0.30]),
+                                      dtype=float),
+                cb_name=cfg.get("mount_sync_name", "franka_base_sync"),
+            )
 
         # NOTE: cannot touch gripper here — its joint-positions function is
         # only populated after world.reset_async() initializes the articulation.
