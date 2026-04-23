@@ -44,17 +44,85 @@ class Manipulator(ABC):
 
 
 # ────────────────────────────────────────────────────────────────
-# Shared helper — spawns a Franka via the Isaac Sim example class
+# Shared helpers — spawn Franka, optionally bolt it to an AMR chassis
 # ────────────────────────────────────────────────────────────────
 def _spawn_franka(world, cfg: dict) -> Franka:
-    position = np.array(cfg.get("position", [0.0, 0.0, 0.0]), dtype=float)
+    """Spawn Franka at a fixed world position.
+
+    If cfg["mount_to"] is set, we instead spawn the Franka at a position
+    derived from the mount body's current transform + mount_local_offset,
+    and then create a PhysX FixedJoint so the arm moves rigidly with the
+    mount (e.g. Nova Carter's chassis). See _rigid_mount() below.
+    """
+    mount_to = cfg.get("mount_to")
+    if mount_to:
+        mount_pos = _world_pos_of(mount_to)
+        local_offset = np.array(cfg.get("mount_local_offset", [0.0, 0.0, 0.30]),
+                                dtype=float)
+        position = mount_pos + local_offset
+    else:
+        position = np.array(cfg.get("position", [0.0, 0.0, 0.0]), dtype=float)
+
     franka = Franka(
         prim_path=cfg.get("prim_path", "/World/Franka"),
         name=cfg.get("name", "franka"),
         position=position,
     )
     world.scene.add(franka)
+
+    if mount_to:
+        _rigid_mount(
+            body0_prim=mount_to,
+            body1_prim=cfg.get("prim_path", "/World/Franka"),
+            local_offset=np.array(cfg.get("mount_local_offset", [0.0, 0.0, 0.30]),
+                                  dtype=float),
+            joint_prim=cfg.get("mount_joint_prim", "/World/FrankaMount"),
+        )
     return franka
+
+
+def _world_pos_of(prim_path: str) -> np.ndarray:
+    """Return the world-space translation of a prim. Falls back to origin
+    if the prim isn't translated yet (e.g. sim not reset)."""
+    import omni.usd
+    from pxr import UsdGeom
+    stage = omni.usd.get_context().get_stage()
+    prim = stage.GetPrimAtPath(prim_path)
+    if not prim or not prim.IsValid():
+        print(f"[manipulator] mount target not found: {prim_path} — using origin")
+        return np.zeros(3)
+    xform = UsdGeom.Xformable(prim)
+    mat = xform.ComputeLocalToWorldTransform(0)
+    t = mat.ExtractTranslation()
+    return np.array([t[0], t[1], t[2]], dtype=float)
+
+
+def _rigid_mount(body0_prim: str, body1_prim: str,
+                 local_offset: np.ndarray, joint_prim: str) -> None:
+    """Create a PhysX FixedJoint that rigidly attaches body1 to body0.
+
+    body0 is the anchor (AMR chassis), body1 is the follower (Franka base).
+    local_offset is the position of the Franka relative to body0's frame.
+    """
+    import omni.usd
+    from pxr import UsdPhysics, Gf, Sdf
+    stage = omni.usd.get_context().get_stage()
+
+    if stage.GetPrimAtPath(joint_prim):
+        print(f"[manipulator] FixedJoint already exists at {joint_prim}; skipping")
+        return
+
+    joint = UsdPhysics.FixedJoint.Define(stage, Sdf.Path(joint_prim))
+    joint.CreateBody0Rel().SetTargets([Sdf.Path(body0_prim)])
+    joint.CreateBody1Rel().SetTargets([Sdf.Path(body1_prim)])
+    # body1 pose expressed in body0's frame
+    joint.CreateLocalPos0Attr().Set(Gf.Vec3f(float(local_offset[0]),
+                                             float(local_offset[1]),
+                                             float(local_offset[2])))
+    joint.CreateLocalRot0Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+    joint.CreateLocalPos1Attr().Set(Gf.Vec3f(0.0, 0.0, 0.0))
+    joint.CreateLocalRot1Attr().Set(Gf.Quatf(1.0, 0.0, 0.0, 0.0))
+    print(f"[manipulator] FixedJoint: {body0_prim} -- offset={local_offset.tolist()} --> {body1_prim}")
 
 
 # ────────────────────────────────────────────────────────────────

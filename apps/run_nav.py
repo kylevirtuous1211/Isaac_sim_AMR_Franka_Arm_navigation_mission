@@ -68,8 +68,21 @@ try:
     status = NavStatus.RUNNING
     tick = 0
 
+    # Capture the current nav generation — if bootstrap / teardown bumps it
+    # while we're running, bail out cleanly. Prevents this loop from driving
+    # the AMR after the user has started a new script.
+    # getattr() fallback because core.state is preserved across script runs;
+    # an older cached version may not have this attribute yet.
+    my_gen = getattr(state, "nav_generation", 0)
+    log(f"nav_generation captured = {my_gen}")
+
     while tick < max_ticks:
         await omni.kit.app.get_app().next_update_async()
+        cur_gen = getattr(state, "nav_generation", 0)
+        if cur_gen != my_gen:
+            log(f"nav_generation changed ({my_gen} → {cur_gen}) — aborting")
+            navigator.stop()
+            break
         status = navigator.step()
         tick += 1
         if tick % 200 == 0:

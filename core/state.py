@@ -46,6 +46,19 @@ scene_loaded_path: Optional[str] = None   # URL of whichever stage is open
 config: Optional[dict] = None             # parsed config.yaml
 extras: dict[str, Any] = {}               # any other per-run handles
 
+# Monotonic counter — bumped by bootstrap / reset / teardown. Long-running
+# app loops (e.g. run_nav.py) should capture this at start and exit if it
+# ever changes, which lets us abort stale background loops without killing
+# the whole Kit process.
+nav_generation: int = 0
+
+
+def bump_generation() -> int:
+    """Invalidate every currently-running nav loop. Returns the new generation."""
+    global nav_generation
+    nav_generation += 1
+    return nav_generation
+
 
 def is_ready() -> bool:
     """True once bootstrap has populated the core handles."""
@@ -78,6 +91,7 @@ def teardown() -> None:
     scene_loaded_path = None
     config = None
     extras.clear()
+    bump_generation()  # also abort any running loops
 
 
 def summary() -> str:

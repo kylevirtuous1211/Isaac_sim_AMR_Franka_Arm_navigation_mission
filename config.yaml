@@ -53,12 +53,16 @@ manipulator:
   type: franka_rmpflow
   prim_path: "/World/Franka"
   name: "franka"
-  # Parked at a fixed "arm station" away from the AMR's path. When we
-  # wire up true mobile-manipulation later we'll either (a) fix-joint
-  # the Franka to the Nova Carter chassis, or (b) have the AMR drive
-  # TO this station to hand off the cube. For now it must NOT overlap
-  # the AMR or it collides and jams the wheels.
-  position: [8.0, 0.0, 0.0]
+  # Mount the arm RIGIDLY on top of the Nova Carter chassis via a PhysX
+  # FixedJoint. The arm now moves as one body with the AMR (true mobile
+  # manipulation). Without the joint, the Franka would fall onto and
+  # jam the AMR's wheels.
+  #
+  # To revert to "parked arm station" mode, comment out mount_to and
+  # set `position: [8.0, 0.0, 0.0]` instead.
+  mount_to: "/World/NovaCarter/chassis_link"
+  mount_local_offset: [0.0, 0.0, 0.30]   # arm base 30 cm above chassis top
+  mount_joint_prim: "/World/FrankaMount"
   clearance_height: 0.15
   approach_tolerance: 0.04
   grasp_hold_ticks: 40

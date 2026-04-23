@@ -49,6 +49,15 @@ try:
         # re-open the gripper and re-play the sim.
         log(state.summary())
         log("State already populated — fast-reset instead of full reload.")
+
+        # Abort any stale run_*.py loop still running in the background
+        # (Kit process keeps them alive across our script invocations).
+        # Inline instead of state.bump_generation() because core.state is
+        # preserved across script runs, so new functions added there don't
+        # show up in the already-imported module.
+        state.nav_generation = getattr(state, "nav_generation", 0) + 1
+        log(f"nav_generation bumped → {state.nav_generation} (stale loops will exit)")
+
         world = state.world
         await world.reset_async()
         state.manipulator.reset()
@@ -69,6 +78,10 @@ try:
             await omni.kit.app.get_app().next_update_async()
         log(f"AMR pose after reset: {state.navigator.get_pose()[0].tolist()}")
     else:
+        # Full-bootstrap path also invalidates stale loops.
+        state.nav_generation = getattr(state, "nav_generation", 0) + 1
+        log(f"nav_generation bumped → {state.nav_generation} (stale loops will exit)")
+
         # ── 1. Hospital stage ────────────────────────────────
         # Always reload the stage here: if state is NOT populated but a
         # previous script left prims in the world (e.g. old `nova_carter`),
