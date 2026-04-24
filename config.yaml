@@ -54,22 +54,33 @@ manipulator:
   prim_path: "/World/Franka"
   name: "franka"
 
-  # --- 'Arm station' mode ---
-  # Franka is parked at a FIXED world position near the cube pickup.
-  # The AMR drives to a handoff pose, then Franka (standing at its
-  # station) picks the cube and places it at point_b.
-  #
-  # Why not mobile-manip (mount_to) for pick/place:
-  # Isaac Sim's PickPlaceController + RMPflow assume a stable
-  # articulation root at its spawn position. Teleporting the Franka
-  # via `franka.set_world_pose()` each tick updates the USD xform
-  # but not the PhysX articulation base frame — IK then plans from
-  # the original spawn position (here, where the AMR started), so
-  # target reaches to (2, 1, ...) resolve to out-of-range poses
-  # (>2 m from spawn). Parking Franka at the cube fixes this.
-  position: [1.5, 1.0, 0.0]                # next to cube at Point A
+  # --- 'Arm station' mode (the working baseline for pick+place) ---
+  # Franka is parked at a fixed world position next to the cube. The
+  # AMR still navigates to Point A for the demo, but the arm isn't
+  # physically on it. This is the only configuration where pick+place
+  # currently succeeds.
+  position: [1.5, 1.0, 0.0]
 
-  # --- Disabled: mobile-manipulation mount (see note above) ---
+  # --- Mobile-manipulation mount (VISUAL ONLY — pick does NOT work)
+  # When mount_to is set, bootstrap installs a pose-sync physics
+  # callback that teleports Franka's USD xform to chassis_link +
+  # offset every tick. The arm visually rides the AMR.
+  #
+  # BUT: `franka.set_world_pose()` (what pose-sync calls) only
+  # updates the USD transform. For a fixed-base articulation, PhysX
+  # caches the physics base pose at spawn time and does NOT track
+  # USD updates. `manipulator.rebase()` tries to refresh this but
+  # can only rebuild the PickPlaceController and set_default_state,
+  # which take effect on `world.reset()` — and reset wipes the
+  # entire scene. Net: IK still plans from the spawn pose and
+  # the arm picks at the wrong world location.
+  #
+  # To unlock real mobile manip one of the following is needed:
+  #   (a) Author a merged Nova_Carter_Franka.usd offline using the
+  #       GUI Robot Assembler (one articulation, PhysX solves
+  #       kinematics natively).
+  #   (b) Write a custom controller that reads PhysX base pose live
+  #       each tick, bypassing PickPlaceController.
   # mount_to: "/World/NovaCarter/chassis_link"
   # mount_local_offset: [0.0, 0.0, 0.50]
   # mount_sync_name: "franka_base_sync"

@@ -102,11 +102,11 @@ try:
                 wheel_vels = vels[wheel_idx].tolist() if len(vels) >= max(wheel_idx) + 1 else None
             log(f"  t {tick}: pos={[round(p,2) for p in pos[:2].tolist()]} "
                 f"yaw={yaw_deg:.1f}° dist={dist:.2f}m wheel={wheel_vels} {status.value}")
-        if status in (NavStatus.REACHED, NavStatus.FAILED):
+        if status.value in ("reached", "failed"):
             break
-    if status == NavStatus.REACHED:
+    if status.value == "reached":
         log(f"REACHED goal at tick {tick}")
-    elif status == NavStatus.FAILED:
+    elif status.value == "failed":
         log("FAILED to reach goal (no path / out of replans)")
     else:
         log(f"TIMEOUT at {max_ticks} ticks (still {status.value})")

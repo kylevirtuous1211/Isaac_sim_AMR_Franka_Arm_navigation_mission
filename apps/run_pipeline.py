@@ -81,27 +81,48 @@ try:
             pos, _ = navigator.get_pose()
             log(f"  t {tick}: AMR={[round(float(p), 2) for p in pos[:2]]}, "
                 f"status={nav_status.value}")
-        if nav_status in (NavStatus.REACHED, NavStatus.FAILED):
+        if nav_status.value in ("reached", "failed"):
             break
 
     amr_pos, amr_ori = navigator.get_pose()
     log(f"AMR final pose after nav: {amr_pos.tolist()} (status={nav_status.value})")
-    if nav_status != NavStatus.REACHED:
+    if nav_status.value != "reached":
         log(f"FAILED: navigation didn't REACH (status={nav_status.value})")
         await world.pause_async()
         raise SystemExit(0)
 
     # ── Stop AMR cold before arm operation ───────────────────
-    # Station mode: Franka is parked at a fixed world position near
-    # Point A (see config.yaml manipulator.position). The AMR drives up
-    # but the arm itself is not mounted on it — see docs for why mobile
-    # manipulation with built-in PickPlaceController is a known
-    # limitation (IK caches the articulation root at construction).
     navigator.stop()
-    manipulator.reset()
     for _ in range(30):
         await omni.kit.app.get_app().next_update_async()
-    log(f"=== Phase 2: AMR stationary at {amr_pos.tolist()}, arm ready ===")
+
+    # ── PHASE 2: arm prep ────────────────────────────────────
+    # Only touch pose-sync + rebase when mount_to is configured (mobile
+    # manipulation). In station mode Franka is already at a fixed world
+    # position that the IK knows about — moving it would BREAK pick.
+    mount_to = CFG["manipulator"].get("mount_to")
+    if mount_to:
+        sync_cb_name = CFG["manipulator"].get("mount_sync_name", "franka_base_sync")
+        mount_offset = np.array(
+            CFG["manipulator"].get("mount_local_offset", [0, 0, 0.5]),
+            dtype=float,
+        )
+        try:
+            world.remove_physics_callback(sync_cb_name)
+            log(f"Disabled pose-sync '{sync_cb_name}' for manipulation")
+        except Exception:
+            pass
+        new_base = amr_pos.copy()
+        new_base[2] = amr_pos[2] + mount_offset[2]
+        log(f"=== Phase 2: rebase Franka to {new_base.tolist()} ===")
+        if hasattr(manipulator, "rebase"):
+            manipulator.rebase(new_base, world_orientation=amr_ori)
+    else:
+        log("=== Phase 2: station mode — skipping rebase ===")
+
+    manipulator.reset()
+    for _ in range(60):
+        await omni.kit.app.get_app().next_update_async()
 
     # ── PHASE 3: pick cube, place at a reachable nearby spot ─
     cube = world.scene.get_object("target_cube")
@@ -140,7 +161,7 @@ try:
         if tick % 300 == 0 and tick > 0:
             cp, _ = cube.get_world_pose()
             log(f"  t {tick}: phase={cur_phase}, cube={[round(float(v), 2) for v in cp]}")
-        if manip_status in (ManipStatus.DONE, ManipStatus.FAILED):
+        if manip_status.value in ("done", "failed"):
             break
 
     # ── PHASE 4: report ─────────────────────────────────────
@@ -151,7 +172,7 @@ try:
     log(f"Final cube pos: {cube_final.tolist()}")
     log(f"Place error (XY): {place_err_xy:.3f} m")
 
-    if manip_status == ManipStatus.DONE and place_err_xy < 0.30:
+    if manip_status.value == "done" and place_err_xy < 0.30:
         log(f"SUCCESS: pipeline complete. Cube moved from ~{cube_pos.tolist()} "
             f"to {cube_final.tolist()}")
     else:

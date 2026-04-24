@@ -61,16 +61,26 @@ try:
         except Exception:
             pass
 
-    # If mount_to is configured (mobile manip), we'd normally disable the
-    # pose-sync here. With the current config (station mode, Franka at a
-    # fixed world position), there's no sync callback to disable.
-    sync_cb_name = CFG["manipulator"].get("mount_sync_name")
-    if sync_cb_name:
-        try:
-            world.remove_physics_callback(sync_cb_name)
-            log(f"Disabled pose-sync callback '{sync_cb_name}' for manipulation")
-        except Exception:
-            pass
+    # Mobile-manip gate: only disable the sync + rebase when mount_to is
+    # configured. In station mode Franka's base is fixed at spawn; moving
+    # it would break the PickPlaceController's cached IK reference.
+    mount_to = CFG["manipulator"].get("mount_to")
+    if mount_to:
+        sync_cb_name = CFG["manipulator"].get("mount_sync_name")
+        if sync_cb_name:
+            try:
+                world.remove_physics_callback(sync_cb_name)
+                log(f"Disabled pose-sync '{sync_cb_name}' for manipulation")
+            except Exception:
+                pass
+        amr_pos, amr_ori = navigator.get_pose()
+        offset = np.array(CFG["manipulator"].get("mount_local_offset", [0, 0, 0.5]),
+                          dtype=float)
+        new_base = amr_pos.copy()
+        new_base[2] = amr_pos[2] + offset[2]
+        if hasattr(manipulator, "rebase"):
+            manipulator.rebase(new_base, world_orientation=amr_ori)
+            log(f"Rebased Franka to AMR pose + offset = {new_base.tolist()}")
 
     await world.play_async()
 
@@ -127,7 +137,7 @@ try:
                 f"cube_z={float(pos[2]):.3f}")
             last_logged_phase = cur_phase
 
-        if status in (ManipStatus.DONE, ManipStatus.FAILED):
+        if status.value in ("done", "failed"):
             break
 
         if tick % 500 == 0 and tick > 0:
@@ -145,7 +155,7 @@ try:
     log(f"Final cube pos: {cube_final.tolist()}")
     log(f"Distance from cube to place target: {place_dist:.3f} m")
 
-    if status == ManipStatus.DONE:
+    if status.value == "done":
         log(f"SUCCESS: manipulator cycle DONE (phase={manipulator.get_phase()})")
     else:
         log(f"FAILED: status={status.value}, phase={manipulator.get_phase()}")
