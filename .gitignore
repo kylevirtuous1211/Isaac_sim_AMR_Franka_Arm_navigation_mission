@@ -18,6 +18,9 @@ venv/
 _inspect_*.py
 _set_camera.py
 _diag_*.py
+_probe_*.py
+_check_*.py
+_disable_*.py
 00_diagnose_paths.py
 
 # OS
