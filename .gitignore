@@ -31,3 +31,4 @@ Thumbs.db
 *.png
 *.mp4
 *.jpg
+.worktrees/
