@@ -26,7 +26,7 @@ Three orthogonal roles, all selectable via `config.yaml` → `type`:
      │
      ▼
 ┌──────────────┐
-│ Manipulator  │  (FrankaRMPflow / FrankaPickPlace)
+│ Manipulator  │  (FrankaRMPflow)
 └──────────────┘
 ```
 
@@ -44,7 +44,7 @@ midterm_project/
 ├── core/
 │   ├── planner.py               # Planner ABC + RRTStarPlanner + StraightLinePlanner + OccupancyGrid
 │   ├── navigator.py             # Navigator ABC + WaypointNavigator
-│   ├── manipulator.py           # Manipulator ABC + FrankaRMPflow + FrankaPickPlace
+│   ├── manipulator.py           # Manipulator ABC + FrankaRMPflow
 │   ├── randomizer.py            # Randomizer for Part 4 (domain randomization)
 │   ├── factory.py               # registries + build_planner / build_navigator / build_manipulator
 │   └── state.py                 # process-wide cache of live handles (shared across apps)
@@ -98,7 +98,7 @@ navigator:
   robot:
     usd_path: "/Isaac/Robots/NVIDIA/Jetbot/jetbot.usd"   # swap to JetBot
 manipulator:
-  type: franka_pickplace       # was: franka_rmpflow — simpler controller
+  type: franka_rmpflow         # only registered manipulator type
 ```
 
 No code changes required — `core/factory.py` picks the registered class

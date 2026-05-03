@@ -1,119 +1,121 @@
-# ============================================================
-# Midterm Project Configuration
-# All tunable variables in one place. Swap `type` fields to switch
-# concrete implementations without touching code.
-# ============================================================
-
-# ── Scene ─────────────────────────────────────────────────────
 scene:
-  usd_path: "/Isaac/Environments/Hospital/hospital.usd"
-
-# ── Global path planner ───────────────────────────────────────
+  usd_path: /Isaac/Environments/Hospital/hospital.usd
 planner:
-  type: rrt_star              # registry key in core/factory.py (PLANNERS)
-  # Shared occupancy grid (used as the collision oracle).
-  # Raycast origin is HIGH above the scene so rays enter obstacles from
-  # outside — origin-inside-wall would give unreliable hits.
+  type: rrt_star
   occupancy:
-    cell_size: 0.25                 # meters per cell (coarser = faster build)
-    raycast_z: 5.0                  # ray origin height (above indoor geometry)
-    obstacle_threshold: 0.15        # hit taller than this → occupied
-    bounds: [-15, 15, -15, 15]      # world XY bounds to sample
-  # RRT* tuning
+    cell_size: 0.25
+    raycast_z: 5.0
+    obstacle_threshold: 0.15
+    bounds:
+    - -15
+    - 15
+    - -15
+    - 15
   rrt_star:
     max_iter: 3000
     step_size: 0.6
     goal_bias: 0.15
     rewire_radius: 1.5
-    goal_tolerance: 0.3
+    goal_tolerance: 0.1
     smooth: true
-    seed: null                # null = nondeterministic
-
-# ── AMR base navigator ────────────────────────────────────────
+    seed: null
 navigator:
   type: waypoint
   robot:
-    usd_path: "/Isaac/Robots/NVIDIA/NovaCarter/nova_carter.usd"
-    prim_path: "/World/NovaCarter"
-    name: "nova_carter"
-    start_position: [0.0, 0.0, 0.0]
-    start_orientation: [1.0, 0.0, 0.0, 0.0]  # quaternion (w, x, y, z)
-    wheel_dof_names: ["joint_wheel_left", "joint_wheel_right"]
+    usd_path: /Isaac/Robots/NVIDIA/NovaCarter/nova_carter.usd
+    prim_path: /World/NovaCarter
+    name: nova_carter
+    start_position:
+    - 0.0
+    - 0.0
+    - 0.0
+    start_orientation:
+    - 1.0
+    - 0.0
+    - 0.0
+    - 0.0
+    wheel_dof_names:
+    - joint_wheel_left
+    - joint_wheel_right
     wheel_radius: 0.04
     wheel_base: 0.413
-  max_linear_speed: 0.30           # m/s — lower = less overshoot
-  max_angular_speed: 0.6           # rad/s — lower = tighter convergence
-  waypoint_reach_threshold: 0.50   # meters — wider than the AMR's turning radius; accepts "close enough"
-  stuck_threshold_ticks: 240       # ticks of no motion before re-plan
-  stuck_position_tolerance: 0.01   # meters — under this = "not moving"
+  max_linear_speed: 0.3
+  max_angular_speed: 0.6
+  waypoint_reach_threshold: 0.25
+  stuck_threshold_ticks: 240
+  stuck_position_tolerance: 0.01
   max_replans: 3
-
-# ── Arm manipulator ───────────────────────────────────────────
 manipulator:
-  type: franka_pickplace           # franka_rmpflow for RMPflow-based obstacle avoidance
-  prim_path: "/World/Franka"
-  name: "franka"
-
-  # --- 'Arm station' mode (the working baseline for pick+place) ---
-  # Franka is parked at a fixed world position next to the cube. The
-  # AMR still navigates to Point A for the demo, but the arm isn't
-  # physically on it. This is the only configuration where pick+place
-  # currently succeeds.
-  position: [1.5, 1.0, 0.0]
-
-  # --- Mobile-manipulation mount (VISUAL ONLY — pick does NOT work)
-  # When mount_to is set, bootstrap installs a pose-sync physics
-  # callback that teleports Franka's USD xform to chassis_link +
-  # offset every tick. The arm visually rides the AMR.
-  #
-  # BUT: `franka.set_world_pose()` (what pose-sync calls) only
-  # updates the USD transform. For a fixed-base articulation, PhysX
-  # caches the physics base pose at spawn time and does NOT track
-  # USD updates. `manipulator.rebase()` tries to refresh this but
-  # can only rebuild the PickPlaceController and set_default_state,
-  # which take effect on `world.reset()` — and reset wipes the
-  # entire scene. Net: IK still plans from the spawn pose and
-  # the arm picks at the wrong world location.
-  #
-  # To unlock real mobile manip one of the following is needed:
-  #   (a) Author a merged Nova_Carter_Franka.usd offline using the
-  #       GUI Robot Assembler (one articulation, PhysX solves
-  #       kinematics natively).
-  #   (b) Write a custom controller that reads PhysX base pose live
-  #       each tick, bypassing PickPlaceController.
-  # mount_to: "/World/NovaCarter/chassis_link"
-  # mount_local_offset: [0.0, 0.0, 0.50]
-  # mount_sync_name: "franka_base_sync"
-  # --- Pick & place tunables ---
-  clearance_height: 0.15            # meters above pick/place target for approach/lift
-  approach_tolerance: 0.04          # end-effector within this distance = phase done
-  grasp_hold_ticks: 40              # how long to hold the grip after closing
-  release_hold_ticks: 30            # how long to wait after opening before retract
-  phase_timeout_ticks: 800          # abort a phase after this many stuck ticks
-  pick_z_offset: 0.0                # extra Z added to pick target (positive = higher grip)
-  place_z_offset: 0.03              # drop-from-height: release this far above target
-  rmpflow_config: "/workspace/configs/rmpflow/franka_rmpflow_common.yaml"
-  rmpflow: {}                       # override robot_description_path / urdf_path here
-
-# ── Task (default fixed points — overridden by randomizer) ────
+  type: franka_rmpflow
+  prim_path: /World/Franka
+  name: franka
+  mount_to: /World/NovaCarter/chassis_link
+  mount_local_offset:
+  - 0.0
+  - 0.0
+  - 0.35
+  # mount_mode controls how the Franka rides on the AMR:
+  #   pose_sync   — per-tick callback teleports Franka to chassis + offset.
+  #                 Decoupled physics (Franka mass doesn't load wheels).
+  #   fixed_joint — UsdPhysics.FixedJoint with excludeFromArticulation.
+  #                 Real PhysX coupling: arm mass loads wheels, reaction
+  #                 torques propagate. Authored by apps/bootstrap.py.
+  mount_mode: fixed_joint
+  mount_sync_name: franka_base_sync
+  clearance_height: 0.15
+  approach_tolerance: 0.07
+  grasp_hold_ticks: 40
+  release_hold_ticks: 30
+  phase_timeout_ticks: 800
+  pick_z_offset: -0.1
+  place_z_offset: 0.1
+  rmpflow_config: /workspace/configs/rmpflow/franka_rmpflow_common.yaml
+  rmpflow: {}
+  surface_gripper:
+    max_grip_distance: 0.15
+    coaxial_force_limit: 50.0
+    shear_force_limit: 50.0
+    retry_interval: 1.0
+    grip_offset_z: 0.1
 task:
-  point_a: [2.0, 1.0, 0.0]         # pick location
-  point_b: [5.0, 3.0, 0.0]         # place location
-  cube_size: 0.0515                # 5.15 cm cube (Isaac Sim default)
-
-# ── Domain randomization (Section 4) ──────────────────────────
+  point_a:
+  - 2.0
+  - 1.0
+  - 0.0
+  point_b:
+  - 4.0
+  - 1.0
+  - 0.0
+  cube_size: 0.0515
+  place_standoff: 0.4
+  place_tolerance: 0.2
+  in_gripper_tolerance: 0.06
 randomization:
-  enabled: false                    # set true in 05_randomized_runs.py
+  enabled: false
   seed: null
   max_attempts: 100
   min_separation: 0.5
   cube_z: 0.025
-  start_bounds: [-1.0, 1.0, -1.0, 1.0]    # AMR start (x_min, x_max, y_min, y_max)
-  goal_bounds:  [3.0, 7.0, 1.0, 5.0]      # AMR goal
-  cube_bounds:  [1.5, 3.0, 0.5, 2.0]      # cube pick position
-  place_bounds: [4.0, 6.0, 2.0, 4.0]      # cube place position
-
-# ── Simulation ────────────────────────────────────────────────
+  start_bounds:
+  - -1.0
+  - 1.0
+  - -1.0
+  - 1.0
+  goal_bounds:
+  - 3.0
+  - 7.0
+  - 1.0
+  - 5.0
+  cube_bounds:
+  - 1.5
+  - 3.0
+  - 0.5
+  - 2.0
+  place_bounds:
+  - 4.0
+  - 6.0
+  - 2.0
+  - 4.0
 simulation:
   max_ticks: 50000
-  physics_dt: null                  # null = use Isaac Sim default
+  physics_dt: null

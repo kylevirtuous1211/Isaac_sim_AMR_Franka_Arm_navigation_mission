@@ -76,6 +76,32 @@ def make_logger(name: str):
     return log, path
 
 
+def make_stream_logger(name: str):
+    """High-frequency append-mode logger for per-tick telemetry.
+
+    Unlike make_logger (which rewrites the whole buffer every call),
+    this opens with "a" so each emit costs one fsync. Truncates once
+    at start so old runs don't bleed in. `tail -f` from the host shows
+    a live stream — drop-in equivalent of a ROS topic for our use.
+
+    Log file: /root/.nvidia-omniverse/logs/<name>.stream.log
+    """
+    path = os.path.join(_LOG_DIR, f"{name}.stream.log")
+    try:
+        open(path, "w").close()  # truncate previous run
+    except Exception:
+        pass
+
+    def emit(msg: str) -> None:
+        try:
+            with open(path, "a") as f:
+                f.write(str(msg) + "\n")
+        except Exception:
+            pass
+
+    return emit, path
+
+
 def load_config() -> dict:
     """Load and return the parsed config.yaml."""
     import yaml

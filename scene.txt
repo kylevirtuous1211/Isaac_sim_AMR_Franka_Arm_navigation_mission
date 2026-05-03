@@ -1,4 +1,0 @@
-Hi everyone,
-
-Please be advised that we will be using the built-in hospital.usd from Isaac Sim as the official environment for our midterm project. You can find the file path as shown in the attached screenshot.
-

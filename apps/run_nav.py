@@ -11,6 +11,7 @@ import sys
 import traceback
 
 sys.path.insert(0, "/workspace/midterm_project")
+sys.modules.pop("apps._common", None)
 from apps._common import bootstrap_imports, load_config, make_logger  # noqa: E402
 
 bootstrap_imports()

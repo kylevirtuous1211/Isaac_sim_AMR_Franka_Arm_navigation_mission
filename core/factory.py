@@ -19,7 +19,6 @@ from .navigator import Navigator, WaypointNavigator
 from .manipulator import (
     Manipulator,
     FrankaRMPflowManipulator,
-    FrankaPickPlaceManipulator,
 )
 
 
@@ -34,7 +33,6 @@ NAVIGATORS: dict[str, Type[Navigator]] = {
 
 MANIPULATORS: dict[str, Type[Manipulator]] = {
     "franka_rmpflow": FrankaRMPflowManipulator,
-    "franka_pickplace": FrankaPickPlaceManipulator,
 }
 
 

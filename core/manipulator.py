@@ -1,7 +1,6 @@
 """Arm control with obstacle avoidance.
 
 Manipulator (ABC)
-├── FrankaPickPlaceManipulator — simple time-based PickPlaceController
 └── FrankaRMPflowManipulator   — RMPflow with obstacle field (reactive avoidance)
 """
 from __future__ import annotations
@@ -21,12 +20,6 @@ class ManipStatus(Enum):
     FAILED = "failed"
 
 
-class Action(Enum):
-    NONE = "none"
-    PICK = "pick"
-    PLACE = "place"
-
-
 # ────────────────────────────────────────────────────────────────
 class Manipulator(ABC):
     @abstractmethod
@@ -41,6 +34,12 @@ class Manipulator(ABC):
     def step(self) -> ManipStatus: ...
     @abstractmethod
     def reset(self) -> None: ...
+    def ensure_mount_sync(self, world) -> None:
+        """Re-install the pose-sync physics callback if this manipulator is
+        configured with a mount. Default: no-op. See
+        FrankaRMPflowManipulator.ensure_mount_sync for the mobile-manip case.
+        """
+        return None
 
 
 # ────────────────────────────────────────────────────────────────
@@ -49,18 +48,21 @@ class Manipulator(ABC):
 def _spawn_franka(world, cfg: dict) -> Franka:
     """Spawn Franka at a fixed world position.
 
-    If cfg["mount_to"] is set, we spawn the Franka above that prim and
-    install a per-tick pose-sync so the base follows it.
-
-    Why not a PhysX FixedJoint: linking two separate articulations
-    (Nova Carter + Franka) via FixedJoint causes PhysX to treat one of
-    them as rooted to world, jamming the wheels. The kinematic-sync
-    pattern avoids that by keeping the articulations independent and
-    just teleporting Franka's base every physics tick.
+    If cfg["mount_to"] is set, we spawn the Franka above that prim. The
+    actual mount enforcement depends on cfg["mount_mode"]:
+      - "pose_sync" (default): a per-tick callback teleports the Franka
+        base to chassis_link.world_pose + offset. Fast to iterate; the
+        Franka mass doesn't load the wheels.
+      - "fixed_joint": a UsdPhysics.FixedJoint with excludeFromArticulation
+        is authored at bootstrap (see core/franka_mount_joint.py). PhysX
+        treats it as a maximal-coordinate constraint between two
+        independent articulations — Franka mass loads the AMR correctly
+        without the wheel-jamming bug a naive intra-articulation join
+        would trigger.
     """
     mount_to = cfg.get("mount_to")
     if mount_to:
-        mount_pos = _world_pos_of(mount_to)
+        mount_pos, _ = _amr_mount_pose(mount_to)
         local_offset = np.array(cfg.get("mount_local_offset", [0.0, 0.0, 0.30]),
                                 dtype=float)
         position = mount_pos + local_offset
@@ -76,28 +78,35 @@ def _spawn_franka(world, cfg: dict) -> Franka:
     return franka
 
 
-def _world_pos_of(prim_path: str) -> np.ndarray:
-    """Return the world-space translation of a prim."""
+def _amr_mount_pose(prim_path: str) -> tuple[np.ndarray, np.ndarray]:
+    """Live world-space (position, quaternion wxyz) of the AMR mount.
+
+    Prefers the navigator's articulation handle (`state.navigator.robot`),
+    which returns the physics-driven pose every tick. USD's
+    ComputeLocalToWorldTransform is a fallback for sub-link prims; for
+    articulation links it returns the AUTHORED xform, not the current
+    physics state, so the Franka would stay frozen near spawn even as
+    the AMR drives. The articulation API is the source of truth.
+    """
+    try:
+        from core import state as _state
+        nav = getattr(_state, "navigator", None)
+        if nav is not None and getattr(nav, "robot", None) is not None:
+            pos, ori = nav.robot.get_world_pose()
+            return (
+                np.asarray(pos, dtype=float),
+                np.asarray(ori, dtype=float),
+            )
+    except Exception as e:
+        print(f"[manipulator] navigator pose lookup failed, falling back to USD: {e}")
+
+    # USD fallback (used pre-bootstrap or if the navigator isn't built yet)
     import omni.usd
     from pxr import UsdGeom
     stage = omni.usd.get_context().get_stage()
     prim = stage.GetPrimAtPath(prim_path)
     if not prim or not prim.IsValid():
         print(f"[manipulator] mount target not found: {prim_path} — using origin")
-        return np.zeros(3)
-    xform = UsdGeom.Xformable(prim)
-    mat = xform.ComputeLocalToWorldTransform(0)
-    t = mat.ExtractTranslation()
-    return np.array([t[0], t[1], t[2]], dtype=float)
-
-
-def _world_pose_of(prim_path: str) -> tuple[np.ndarray, np.ndarray]:
-    """World-space (position, quaternion wxyz) of a prim."""
-    import omni.usd
-    from pxr import UsdGeom, Gf
-    stage = omni.usd.get_context().get_stage()
-    prim = stage.GetPrimAtPath(prim_path)
-    if not prim or not prim.IsValid():
         return np.zeros(3), np.array([1.0, 0.0, 0.0, 0.0])
     mat = UsdGeom.Xformable(prim).ComputeLocalToWorldTransform(0)
     t = mat.ExtractTranslation()
@@ -110,44 +119,13 @@ def _world_pose_of(prim_path: str) -> tuple[np.ndarray, np.ndarray]:
     )
 
 
-def _make_base_kinematic(franka_prim_path: str, base_link: str = "panda_link0") -> bool:
-    """Mark Franka's base rigid body as kinematic.
-
-    Kinematic bodies:
-      - Are NOT simulated dynamically (gravity / forces don't affect them)
-      - CAN be teleported via set_world_pose without destabilizing physics
-      - Still provide collision and constraint anchors for dynamic children
-
-    This is what makes per-tick pose-sync stable: the base just obeys our
-    teleport; the arm's dynamic links (panda_link1..7 + fingers) remain
-    dynamic, so RMPflow torque control still drives them normally.
-    """
-    import omni.usd
-    from pxr import UsdPhysics
-    stage = omni.usd.get_context().get_stage()
-    base_path = f"{franka_prim_path}/{base_link}"
-    prim = stage.GetPrimAtPath(base_path)
-    if not prim or not prim.IsValid():
-        print(f"[manipulator] base link not found at {base_path}")
-        return False
-    # UsdPhysics.RigidBodyAPI is typically already applied by the Franka USD;
-    # we just flip kinematicEnabled=True.
-    rb = UsdPhysics.RigidBodyAPI(prim)
-    if not rb:
-        rb = UsdPhysics.RigidBodyAPI.Apply(prim)
-    rb.CreateKinematicEnabledAttr(True).Set(True)
-    print(f"[manipulator] {base_path}: kinematicEnabled = True")
-    return True
-
-
 def _install_pose_sync(world, franka: Franka, mount_prim: str,
                       local_offset: np.ndarray, cb_name: str) -> None:
     """Install a physics callback that teleports Franka's base to
     mount_prim.world_pose() + local_offset every tick.
 
-    Prereq: Franka's base must be kinematic (see _make_base_kinematic).
-    Otherwise teleporting a dynamic body creates spurious forces and
-    destabilizes both robots.
+    Franka is fixed-base by default, so set_world_pose() cleanly
+    teleports the whole articulation without destabilizing physics.
     """
     # Remove any prior callback with this name (re-setup idempotency)
     try:
@@ -159,7 +137,7 @@ def _install_pose_sync(world, franka: Franka, mount_prim: str,
 
     def _sync(_step_size):
         try:
-            mount_pos, mount_rot = _world_pose_of(mount_prim)
+            mount_pos, mount_rot = _amr_mount_pose(mount_prim)
             rotated = _rotate_by_quat(offset, mount_rot)
             franka.set_world_pose(
                 position=mount_pos + rotated,
@@ -169,7 +147,6 @@ def _install_pose_sync(world, franka: Franka, mount_prim: str,
             print(f"[manipulator] pose-sync failed: {e}")
 
     world.add_physics_callback(cb_name, callback_fn=_sync)
-    print(f"[manipulator] pose-sync installed: {mount_prim} + {offset.tolist()} → Franka base")
 
 
 def _rotate_by_quat(v: np.ndarray, q: np.ndarray) -> np.ndarray:
@@ -184,141 +161,6 @@ def _rotate_by_quat(v: np.ndarray, q: np.ndarray) -> np.ndarray:
     ry = vy + w * ty + (z * tx - x * tz)
     rz = vz + w * tz + (x * ty - y * tx)
     return np.array([rx, ry, rz], dtype=float)
-
-
-# ────────────────────────────────────────────────────────────────
-# Simple time-based controller (from hand_on_2_franka.py)
-# ────────────────────────────────────────────────────────────────
-class FrankaPickPlaceManipulator(Manipulator):
-    """Uses PickPlaceController — a state-machine with hardcoded timing.
-    Works well when the cube and placement are stationary and reachable.
-    No obstacle avoidance."""
-
-    def __init__(self):
-        self.cfg: dict = {}
-        self.franka: Franka | None = None
-        self.ctrl = None
-        self._target_pick = None
-        self._target_place = None
-        self._action = Action.NONE
-        self._done_latch = False
-
-    def setup(self, world, cfg: dict) -> None:
-        from isaacsim.robot.manipulators.examples.franka.controllers import (
-            PickPlaceController,
-        )
-        self.cfg = cfg
-        self.franka = _spawn_franka(world, cfg)
-        self.ctrl = PickPlaceController(
-            name="pick_place_controller",
-            gripper=self.franka.gripper,
-            robot_articulation=self.franka,
-            events_dt=cfg.get("events_dt"),
-        )
-        # Gripper init is deferred — see note in FrankaRMPflowManipulator.setup().
-
-    def pick(self, xyz) -> None:
-        self._target_pick = np.asarray(xyz, dtype=float)
-        self._target_place = None
-        self._action = Action.PICK
-        self._done_latch = False
-        self.ctrl.reset()
-
-    def rebase(self, world_position, world_orientation=None) -> None:
-        """Move the Franka articulation to a new base pose and rebuild the
-        PickPlaceController so its IK solver uses the new root frame.
-
-        Use when the Franka is riding on an AMR that has just arrived at
-        a pickup/drop-off point: teleport Franka to AMR's current pose,
-        then `rebase(new_pos)` so the controller plans from the new frame.
-        """
-        if self.franka is None or self.ctrl is None:
-            return
-        ori = world_orientation
-        if ori is None:
-            ori = np.array([1.0, 0.0, 0.0, 0.0], dtype=float)
-        # Update the visual/physx xform
-        self.franka.set_world_pose(position=np.asarray(world_position, dtype=float),
-                                   orientation=np.asarray(ori, dtype=float))
-        # Update the articulation's default (post_reset) pose so the
-        # controller's kinematic reference moves with it
-        try:
-            self.franka.set_default_state(
-                position=np.asarray(world_position, dtype=float),
-                orientation=np.asarray(ori, dtype=float),
-            )
-        except Exception as e:
-            print(f"[FrankaPickPlace] set_default_state failed: {e}")
-
-        # Rebuild the controller so its internal reference pose is fresh
-        from isaacsim.robot.manipulators.examples.franka.controllers import (
-            PickPlaceController,
-        )
-        self.ctrl = PickPlaceController(
-            name="pick_place_controller",
-            gripper=self.franka.gripper,
-            robot_articulation=self.franka,
-            events_dt=self.cfg.get("events_dt"),
-        )
-        self._done_latch = False
-        print(f"[FrankaPickPlace] rebased to {list(world_position)}")
-
-    def place(self, xyz) -> None:
-        # PickPlaceController is a single fused pick→place cycle.
-        # To use place() alone, call pick(current_cube_pos) + place(target).
-        self._target_place = np.asarray(xyz, dtype=float)
-        self._action = Action.PLACE
-        self._done_latch = False
-
-    def add_obstacle(self, prim_path: str) -> None:
-        print(f"[FrankaPickPlace] add_obstacle ignored (no avoidance): {prim_path}")
-
-    def step(self) -> ManipStatus:
-        if self._action == Action.NONE:
-            return ManipStatus.IDLE
-        if self._done_latch:
-            return ManipStatus.DONE
-        if self._target_pick is None or self._target_place is None:
-            return ManipStatus.RUNNING
-        joints = self.franka.get_joint_positions()
-        actions = self.ctrl.forward(
-            picking_position=self._target_pick,
-            placing_position=self._target_place,
-            current_joint_positions=joints,
-        )
-        self.franka.apply_action(actions)
-        if self.ctrl.is_done():
-            self._action = Action.NONE
-            self._done_latch = True
-            return ManipStatus.DONE
-        return ManipStatus.RUNNING
-
-    def get_phase(self) -> str:
-        """For symmetry with RMPflow. PickPlaceController is event-driven
-        internally; return a coarse state indicator."""
-        if self._done_latch:
-            return "done"
-        if self._action == Action.NONE:
-            return "idle"
-        return "running"
-
-    def is_done(self) -> bool:
-        return self._done_latch
-
-    def reset(self) -> None:
-        if self.ctrl is not None:
-            self.ctrl.reset()
-        if self.franka is not None:
-            try:
-                self.franka.gripper.set_joint_positions(
-                    self.franka.gripper.joint_opened_positions
-                )
-            except Exception as e:
-                print(f"[FrankaPickPlace] gripper open failed: {e}")
-        self._action = Action.NONE
-        self._target_pick = None
-        self._target_place = None
-        self._done_latch = False
 
 
 # ────────────────────────────────────────────────────────────────
@@ -351,6 +193,12 @@ class FrankaRMPflowManipulator(Manipulator):
         self._approach_tol = 0.03
         self._grasp_hold_ticks = 40
         self._release_hold_ticks = 30
+
+        # SurfaceGripper handle. Authored at bootstrap (see
+        # apps/bootstrap.py), but the runtime interface needs the physics
+        # context live, so we instantiate the wrapper lazily on first
+        # reset() (after world.reset_async + world.play_async).
+        self.surface_gripper = None
 
     def setup(self, world, cfg: dict) -> None:
         from isaacsim.robot_motion.motion_generation import (
@@ -385,13 +233,14 @@ class FrankaRMPflowManipulator(Manipulator):
         self._release_hold_ticks = int(cfg.get("release_hold_ticks", 30))
         self._phase_timeout_ticks = int(cfg.get("phase_timeout_ticks", 800))
 
-        # Mobile-manipulation mount — Franka is fixed-base by default,
-        # so set_world_pose() cleanly teleports the whole articulation.
-        # The pose-sync callback drives that every tick so Franka rides
-        # on top of the moving chassis. Collision with the chassis is
-        # avoided by picking an offset taller than the chassis height.
+        # Mobile-manipulation mount — see _spawn_franka docstring for the
+        # two strategies. In fixed_joint mode the joint is authored from
+        # apps/bootstrap.py (after both articulations spawn but before
+        # world.reset_async); we only install the pose-sync callback in
+        # the legacy pose_sync mode.
         mount_to = cfg.get("mount_to")
-        if mount_to:
+        mount_mode = cfg.get("mount_mode", "pose_sync")
+        if mount_to and mount_mode == "pose_sync":
             _install_pose_sync(
                 world,
                 self.franka,
@@ -400,6 +249,15 @@ class FrankaRMPflowManipulator(Manipulator):
                                       dtype=float),
                 cb_name=cfg.get("mount_sync_name", "franka_base_sync"),
             )
+        elif mount_to and mount_mode == "fixed_joint":
+            # Defensive: if a stale pose_sync callback survives a config
+            # flip mid-session, remove it so it doesn't fight the joint.
+            try:
+                world.remove_physics_callback(
+                    cfg.get("mount_sync_name", "franka_base_sync")
+                )
+            except Exception:
+                pass
 
         # NOTE: cannot touch gripper here — its joint-positions function is
         # only populated after world.reset_async() initializes the articulation.
@@ -429,7 +287,6 @@ class FrankaRMPflowManipulator(Manipulator):
             return
         try:
             self.rmp.add_obstacle(prim)
-            print(f"[RMPflow] obstacle added: {prim_path}")
         except Exception as e:
             print(f"[RMPflow] add_obstacle failed for {prim_path}: {e}")
 
@@ -469,6 +326,13 @@ class FrankaRMPflowManipulator(Manipulator):
         dist = float(np.linalg.norm(ee_pos - target))
         self._tick_in_phase += 1
 
+        # Periodic in-phase diagnostic — surfaces whether RMPflow is
+        # converging (dist trending down) vs. stuck (dist plateaued).
+        if self._tick_in_phase > 0 and self._tick_in_phase % 100 == 0:
+            print(f"[step] phase={self._phase} tick={self._tick_in_phase} "
+                  f"dist={dist:.3f} tol={self._approach_tol:.3f} "
+                  f"ee={ee_pos.tolist()} target={target.tolist()}")
+
         # Phase-level timeout: if we've spent more than N ticks in the same
         # phase without advancing, something is stuck (RMPflow target
         # unreachable, base pose stale, gripper fight, etc.) — bail out.
@@ -500,6 +364,60 @@ class FrankaRMPflowManipulator(Manipulator):
             except Exception as e:
                 print(f"[FrankaRMPflow] gripper open failed: {e}")
 
+        # SurfaceGripper — lazy-init on first reset() call after bootstrap
+        # has authored the prim and world.play_async() has initialized the
+        # PhysX surface_gripper interface. The wrapper holds a C++ handle
+        # so it must be built post-play, not during setup().
+        if self.surface_gripper is None:
+            try:
+                from .surface_gripper_setup import SurfaceGripperWrapper
+                self.surface_gripper = SurfaceGripperWrapper()
+            except Exception as e:
+                print(f"[FrankaRMPflow] SurfaceGripperWrapper init failed: {e}")
+                self.surface_gripper = None
+        # Open the SG on reset so a re-run starts with no cube attached.
+        if self.surface_gripper is not None:
+            try:
+                self.surface_gripper.open()
+            except Exception:
+                pass
+
+    def ensure_mount_sync(self, world) -> None:
+        """Re-install the pose-sync callback if `mount_to` is configured
+        AND `mount_mode == "pose_sync"`.
+
+        `setup()` installs it once on first bootstrap, but scripts like
+        `run_manip.py` may remove it mid-session, and `bootstrap.py`'s
+        fast-reset path doesn't re-run `setup()`. Calling this after each
+        reset makes the mount state idempotent regardless of workflow.
+
+        In `mount_mode == "fixed_joint"` this is a no-op (the FixedJoint
+        is authored from bootstrap and persists in USD across resets).
+        Any stale callback from a prior pose_sync session is also cleared
+        so it can't fight the joint.
+        """
+        mount_to = self.cfg.get("mount_to")
+        mount_mode = self.cfg.get("mount_mode", "pose_sync")
+        if not mount_to or self.franka is None:
+            return
+        cb_name = self.cfg.get("mount_sync_name", "franka_base_sync")
+        if mount_mode == "fixed_joint":
+            try:
+                world.remove_physics_callback(cb_name)
+            except Exception:
+                pass
+            return
+        _install_pose_sync(
+            world,
+            self.franka,
+            mount_prim=mount_to,
+            local_offset=np.array(
+                self.cfg.get("mount_local_offset", [0.0, 0.0, 0.50]),
+                dtype=float,
+            ),
+            cb_name=cb_name,
+        )
+
     # ── phase machinery ──────────────────────────────────────
     def _phase_target(self) -> np.ndarray | None:
         up = np.array([0.0, 0.0, self._clearance_height])
@@ -519,11 +437,23 @@ class FrankaRMPflowManipulator(Manipulator):
 
     def _advance_phase_if_done(self, dist: float) -> None:
         if self._phase == "above_pick" and dist < self._approach_tol:
+            # Fire BOTH grippers at the above_pick→at_pick edge: the
+            # ParallelGripper closes its fingers (visual clamp), and
+            # the SurfaceGripper requests a D6-joint engagement. The
+            # SG manager polls within retry_interval seconds and wires
+            # up the joint as soon as the cube enters max_grip_distance
+            # during the at_pick descent.
+            self.franka.gripper.close()
+            if self.surface_gripper is not None:
+                try:
+                    self.surface_gripper.close()
+                except Exception as e:
+                    print(f"[FrankaRMPflow] SG close failed: {e}")
             self._phase, self._tick_in_phase = "at_pick", 0
-        elif self._phase == "at_pick" and dist < self._approach_tol:
-            self.franka.gripper.set_joint_positions(
-                self.franka.gripper.joint_closed_positions
-            )
+        elif self._phase == "at_pick" and self._tick_in_phase >= self._grasp_hold_ticks:
+            # Time-based transition — `at_pick` is now "hold while
+            # descending and let the SurfaceGripper engage". The actual
+            # close fired at the previous transition.
             self._phase, self._tick_in_phase = "grasp", 0
         elif self._phase == "grasp" and self._tick_in_phase >= self._grasp_hold_ticks:
             self._phase, self._tick_in_phase = "lift", 0
@@ -535,9 +465,15 @@ class FrankaRMPflowManipulator(Manipulator):
         elif self._phase == "above_place" and dist < self._approach_tol:
             self._phase, self._tick_in_phase = "at_place", 0
         elif self._phase == "at_place" and dist < self._approach_tol:
-            self.franka.gripper.set_joint_positions(
-                self.franka.gripper.joint_opened_positions
-            )
+            # Open BOTH grippers. SurfaceGripper.open() releases the D6
+            # joint so the cube starts physics-simulating again; the
+            # ParallelGripper.open() spreads the fingers visually.
+            self.franka.gripper.open()
+            if self.surface_gripper is not None:
+                try:
+                    self.surface_gripper.open()
+                except Exception as e:
+                    print(f"[FrankaRMPflow] SG open failed: {e}")
             self._phase, self._tick_in_phase = "release", 0
         elif self._phase == "release" and self._tick_in_phase >= self._release_hold_ticks:
             self._phase, self._tick_in_phase = "retract", 0
@@ -545,12 +481,23 @@ class FrankaRMPflowManipulator(Manipulator):
             self._phase, self._tick_in_phase = "done", 0
 
     def _ee_position(self) -> np.ndarray:
-        """Return end-effector world position from the RMPflow frame lookup."""
-        if self.rmp is None:
+        """Return end-effector world position via the Franka's `end_effector`
+        rigid-prim handle (the `right_gripper` frame).
+
+        Don't use `rmp.get_end_effector_pose()` here: that method takes a
+        required `active_joint_positions` argument and (in older code) was
+        called bare-arg, raising TypeError silently — which made `dist`
+        compute against (0,0,0) and pinned the FSM in `above_pick` forever.
+        `franka.end_effector.get_world_pose()` is the canonical path and
+        matches how examples/hand_on_3_rmpflow.py reads it.
+        """
+        if self.franka is None:
             return np.zeros(3)
         try:
-            pose = self.rmp.get_end_effector_pose()
-            # Different Isaac Sim versions return different shapes; take the first 3
-            return np.asarray(pose[0] if isinstance(pose, tuple) else pose)[:3]
-        except Exception:
+            pos, _ = self.franka.end_effector.get_world_pose()
+            return np.asarray(pos, dtype=float)
+        except Exception as e:
+            if not getattr(self, "_ee_pose_warned", False):
+                print(f"[FrankaRMPflow] _ee_position failed: {type(e).__name__}: {e}")
+                self._ee_pose_warned = True
             return np.zeros(3)

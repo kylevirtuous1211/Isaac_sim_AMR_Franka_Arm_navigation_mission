@@ -15,7 +15,6 @@
 #     after navigation the cube may have shifted a few cm).
 #   - Calls manipulator.pick(cube_xyz + pick_z_offset)
 #     then manipulator.place(place_xyz + place_z_offset).
-#     FrankaPickPlaceManipulator fuses the two into one cycle;
 #     FrankaRMPflowManipulator chains them via its phase FSM.
 #   - Ticks physics until the manipulator reports DONE (or FAILED,
 #     or we hit max_ticks).
@@ -27,6 +26,7 @@ import sys
 import traceback
 
 sys.path.insert(0, "/workspace/midterm_project")
+sys.modules.pop("apps._common", None)
 from apps._common import bootstrap_imports, load_config, make_logger  # noqa: E402
 
 bootstrap_imports()
@@ -61,26 +61,17 @@ try:
         except Exception:
             pass
 
-    # Mobile-manip gate: only disable the sync + rebase when mount_to is
-    # configured. In station mode Franka's base is fixed at spawn; moving
-    # it would break the PickPlaceController's cached IK reference.
+    # Remove the pose-sync callback while the arm operates so the Franka
+    # base is stable. RMPflow reads the live base pose each tick, so no
+    # rebase is needed.
     mount_to = CFG["manipulator"].get("mount_to")
     if mount_to:
         sync_cb_name = CFG["manipulator"].get("mount_sync_name")
         if sync_cb_name:
             try:
                 world.remove_physics_callback(sync_cb_name)
-                log(f"Disabled pose-sync '{sync_cb_name}' for manipulation")
             except Exception:
                 pass
-        amr_pos, amr_ori = navigator.get_pose()
-        offset = np.array(CFG["manipulator"].get("mount_local_offset", [0, 0, 0.5]),
-                          dtype=float)
-        new_base = amr_pos.copy()
-        new_base[2] = amr_pos[2] + offset[2]
-        if hasattr(manipulator, "rebase"):
-            manipulator.rebase(new_base, world_orientation=amr_ori)
-            log(f"Rebased Franka to AMR pose + offset = {new_base.tolist()}")
 
     await world.play_async()
 
