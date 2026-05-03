@@ -1,22 +1,20 @@
 # ============================================================
 # apps/run_cortex.py — Cortex-style decider network for the
-# mobile pick-and-place pipeline.
+# mobile pick-and-place pipeline, wrapped in a domain-randomized
+# multi-episode loop.
 #
-# Replaces run_pipeline.py's hardcoded 5-phase loop with a
-# DfNetwork that routes on a per-tick block-state classifier:
+# Each episode:
+#   1. Randomizer.sample_episode() picks (start, cube, place).
+#   2. apply_episode_to_cfg + reset_world_for_episode teleport
+#      AMR/Franka/cube/markers to the new layout.
+#   3. ctx.point_a / ctx.point_b are rebound; ctx.reset() clears
+#      pick budget + block_state; the decider network is rebuilt.
+#   4. The per-tick decider loop runs to terminal state (DONE /
+#      FAILED) or to per_episode_max_ticks.
 #
-#   Dispatch
-#     ├── go_home      cube reached B
-#     ├── fail         3 consecutive pick failures
-#     ├── nav_to_block AMR drives to the cube's live position
-#     ├── pick_rlds    arm closes around cube (BumpRetry on fail)
-#     ├── transit      cube in gripper, AMR drives to B-standoff
-#     └── place_rlds   arm drops cube at B
-#
-# Reactivity comes for free: drag the cube mid-execution and
-# the next tick's classifier flips block_state, Dispatch routes
-# to a different child, and df_descend tears down the in-flight
-# sub-sequence. See `cortex/` package for the implementation.
+# Set `randomization.enabled: false` in config.yaml to fall back
+# to a single deterministic episode using the configured
+# task.point_a / task.point_b — useful for debugging.
 #
 # Run via: python3 run_in_isaac.py midterm_project/apps/run_cortex.py
 # Log:     cache/isaac-sim/logs/run_cortex.log
@@ -41,6 +39,8 @@ try:
     import omni.kit.app
 
     from core import state
+    from core.episode import apply_episode_to_cfg, reset_world_for_episode
+    from core.randomizer import Randomizer
     from cortex.context import BlockState, MobileManipContext
     from cortex.network import make_decider_network
 
@@ -51,6 +51,7 @@ try:
     world = state.world
     navigator = state.navigator
     manipulator = state.manipulator
+    planner = state.planner
 
     # ── Hot-apply tunables (mirrors run_pipeline.py) ─────────
     nav_cfg = CFG["navigator"]
@@ -58,7 +59,6 @@ try:
     navigator._stuck_limit = int(nav_cfg.get("stuck_threshold_ticks", 240))
     navigator._max_replans = int(nav_cfg.get("max_replans", 3))
 
-    planner = state.planner
     rrt_cfg = CFG["planner"].get("rrt_star", {})
     if hasattr(planner, "goal_tolerance"):
         planner.goal_tolerance = float(rrt_cfg.get("goal_tolerance", 0.2))
@@ -74,44 +74,41 @@ try:
         f"clearance={manipulator._clearance_height}, "
         f"phase_timeout={manipulator._phase_timeout_ticks}")
 
-    # Clean stale callbacks from prior runs (defensive — bootstrap's
-    # fast-reset clears these but a partial run may have left some).
-    for name in ("run_nav_step", "run_manip_step", "nav_step", "manip_step",
-                 "cube_carry_sync"):
-        try:
-            world.remove_physics_callback(name)
-        except Exception:
-            pass
-
-    # Ensure pose-sync is ON before nav_to_block runs — the nav sequence
-    # doesn't include EnablePoseSync, so if a prior crash left it off the
-    # AMR would drive away from a stationary Franka.
-    manipulator.ensure_mount_sync(world)
-
-    # ── Build context + decider network ──────────────────────
-    task = CFG["task"]
-    point_a = np.array(task["point_a"], dtype=float)[:2]
-    point_b = np.array(task["point_b"], dtype=float)[:2]
-
     cube = world.scene.get_object("target_cube")
     if cube is None:
         raise RuntimeError("target_cube not found in scene — did bootstrap run?")
 
-    ctx = MobileManipContext(navigator, manipulator, cube, point_a, point_b, CFG)
-    network = make_decider_network(ctx)
-    log(f"Decider network built: point_a={point_a.tolist()} "
-        f"point_b={point_b.tolist()} "
-        f"place_tol={ctx.place_tolerance} in_grip_tol={ctx.in_gripper_tolerance} "
-        f"max_pick_attempts={ctx.MAX_PICK_ATTEMPTS}")
+    # ── Randomizer + episode plan ────────────────────────────
+    rand_cfg = CFG.get("randomization", {})
+    rand_enabled = bool(rand_cfg.get("enabled", False))
+    n_episodes = int(rand_cfg.get("episodes", 1)) if rand_enabled else 1
+    randomizer = Randomizer(planner, rand_cfg) if rand_enabled else None
+    sim_cfg = CFG.get("simulation", {})
+    per_ep_ticks = int(sim_cfg.get("per_episode_max_ticks", 8000))
+    settle_ticks = int(sim_cfg.get("inter_episode_settle_ticks", 60))
+    log(f"Episode plan: n={n_episodes} randomized={rand_enabled} "
+        f"per_episode_max_ticks={per_ep_ticks}")
 
-    # ── Per-tick stream telemetry ────────────────────────────
-    def _stream_tick(tick: int):
+    # ── Episode helpers ──────────────────────────────────────
+    def _clean_callbacks():
+        for name in ("run_nav_step", "run_manip_step", "nav_step", "manip_step",
+                     "cube_carry_sync"):
+            try:
+                world.remove_physics_callback(name)
+            except Exception:
+                pass
+
+    async def _settle(n):
+        for _ in range(n):
+            await omni.kit.app.get_app().next_update_async()
+
+    def _stream_tick(ep_idx, tick, ctx):
         try:
             cp, _ = cube.get_world_pose()
             ee = manipulator._ee_position()
             amr_pos, _ = navigator.get_pose()
             stream(
-                f"t={tick} state={ctx.block_state.value} "
+                f"ep={ep_idx} t={tick} state={ctx.block_state.value} "
                 f"pick_attempts={ctx.pick_attempts} "
                 f"manip_phase={manipulator.get_phase()} "
                 f"cube={cp[0]:.3f},{cp[1]:.3f},{cp[2]:.3f} "
@@ -119,68 +116,132 @@ try:
                 f"amr={amr_pos[0]:.3f},{amr_pos[1]:.3f}"
             )
         except Exception as _e:
-            stream(f"t={tick} stream-error: {_e}")
+            stream(f"ep={ep_idx} t={tick} stream-error: {_e}")
 
-    # ── Main loop ────────────────────────────────────────────
-    log("=== run_cortex starting decider loop ===")
+    async def _run_one_episode(ep_idx, point_a_xy, point_b_xy):
+        """Run a single episode to terminal block_state or tick budget.
+        Returns dict with outcome/place_error/ticks/pick_attempts."""
+        # Defensive cleanup — bootstrap clears these on cold-start, but
+        # a partial in-process run may have left some live.
+        _clean_callbacks()
+
+        # Pose-sync must be ON before nav_to_block. The nav sub-decider
+        # never enables it, so a prior crash that left it off would make
+        # the AMR drive away from a stationary Franka.
+        manipulator.ensure_mount_sync(world)
+
+        ctx = MobileManipContext(navigator, manipulator, cube,
+                                 point_a_xy, point_b_xy, CFG)
+        network = make_decider_network(ctx)
+        log(f"  ep={ep_idx} ctx ready: point_a={point_a_xy.tolist()} "
+            f"point_b={point_b_xy.tolist()} "
+            f"place_tol={ctx.place_tolerance}")
+
+        my_gen = getattr(state, "nav_generation", 0)
+        last_state_logged = None
+        tick = 0
+        for tick in range(per_ep_ticks):
+            await omni.kit.app.get_app().next_update_async()
+            if getattr(state, "nav_generation", 0) != my_gen:
+                log("  nav_generation bumped — aborting episode")
+                break
+
+            ctx.last_manip_status = manipulator.step()
+            ctx.last_nav_status = navigator.step()
+            ctx.update_block_state()
+            network.step()
+
+            if ctx.block_state != last_state_logged:
+                cp, _ = cube.get_world_pose()
+                amr_pos, _ = navigator.get_pose()
+                prev_label = (last_state_logged.value
+                              if last_state_logged is not None else "none")
+                log(f"  ep={ep_idx} t {tick}: block_state {prev_label} -> "
+                    f"{ctx.block_state.value} "
+                    f"(cube={[round(float(x), 3) for x in cp]}, "
+                    f"amr={[round(float(x), 2) for x in amr_pos[:2]]}, "
+                    f"manip_phase={manipulator.get_phase()}, "
+                    f"pick_attempts={ctx.pick_attempts})")
+                last_state_logged = ctx.block_state
+
+            if tick % 50 == 0:
+                _stream_tick(ep_idx, tick, ctx)
+
+            if ctx.block_state in (BlockState.DONE, BlockState.FAILED):
+                log(f"  ep={ep_idx} t {tick}: terminal "
+                    f"{ctx.block_state.value}")
+                break
+
+        cube_final, _ = cube.get_world_pose()
+        cube_final = np.asarray(cube_final, dtype=float)
+        err_xy = float(np.linalg.norm(cube_final[:2] - point_b_xy))
+
+        if ctx.block_state == BlockState.DONE:
+            outcome = "success"
+        elif ctx.block_state == BlockState.FAILED:
+            outcome = "failed"
+        else:
+            outcome = "tick_budget_exhausted"
+
+        return {
+            "episode": ep_idx,
+            "outcome": outcome,
+            "block_state": ctx.block_state.value,
+            "place_error_m": err_xy,
+            "ticks": tick + 1,
+            "pick_attempts": ctx.pick_attempts,
+            "point_a": point_a_xy.tolist(),
+            "point_b": point_b_xy.tolist(),
+        }
+
+    # ── Outer loop ──────────────────────────────────────────
+    log("=== run_cortex starting episode loop ===")
     await world.play_async()
+    results = []
 
-    max_ticks = int(CFG.get("simulation", {}).get("max_ticks", 50000))
-    my_gen = getattr(state, "nav_generation", 0)
+    for ep_idx in range(n_episodes):
+        log(f"--- Episode {ep_idx + 1}/{n_episodes} ---")
 
-    last_state_logged = None
-    tick = 0
-    for tick in range(max_ticks):
-        await omni.kit.app.get_app().next_update_async()
-        if getattr(state, "nav_generation", 0) != my_gen:
-            log("nav_generation bumped — aborting")
-            break
+        if randomizer is not None:
+            ep = randomizer.sample_episode()
+            log(f"  sampled: start={ep.start_xy.tolist()} "
+                f"cube={ep.cube_xyz.tolist()} place={ep.place_xyz.tolist()}")
+            apply_episode_to_cfg(CFG, ep)
+            reset_world_for_episode(world, CFG, manipulator, navigator)
+            await _settle(settle_ticks)
 
-        # 1. Advance physics-coupled controllers. Both are no-ops in
-        #    idle/done state. Order matters less than always running
-        #    each one before the classifier reads their phase/status.
-        ctx.last_manip_status = manipulator.step()
-        ctx.last_nav_status = navigator.step()
+        task = CFG["task"]
+        point_a = np.array(task["point_a"], dtype=float)[:2]
+        point_b = np.array(task["point_b"], dtype=float)[:2]
 
-        # 2. Classify the world state, then run the decider.
-        ctx.update_block_state()
-        network.step()
+        try:
+            result = await _run_one_episode(ep_idx, point_a, point_b)
+        except Exception as _e:
+            log(f"  ep={ep_idx} crashed: {type(_e).__name__}: {_e}")
+            log(traceback.format_exc())
+            result = {
+                "episode": ep_idx,
+                "outcome": "crashed",
+                "block_state": "n/a",
+                "place_error_m": float("nan"),
+                "ticks": 0,
+                "pick_attempts": 0,
+                "point_a": point_a.tolist(),
+                "point_b": point_b.tolist(),
+            }
+        results.append(result)
+        log(f"  ep={ep_idx} done: {result}")
 
-        # 3. Log state transitions (one-line per change).
-        if ctx.block_state != last_state_logged:
-            cp, _ = cube.get_world_pose()
-            amr_pos, _ = navigator.get_pose()
-            prev_label = last_state_logged.value if last_state_logged is not None else "none"
-            log(f"  t {tick}: block_state {prev_label} -> {ctx.block_state.value} "
-                f"(cube={[round(float(x), 3) for x in cp]}, "
-                f"amr={[round(float(x), 2) for x in amr_pos[:2]]}, "
-                f"manip_phase={manipulator.get_phase()}, "
-                f"pick_attempts={ctx.pick_attempts})")
-            last_state_logged = ctx.block_state
-
-        if tick % 50 == 0:
-            _stream_tick(tick)
-
-        # 4. Termination
-        if ctx.block_state in (BlockState.DONE, BlockState.FAILED):
-            log(f"  t {tick}: terminal state {ctx.block_state.value} reached")
-            break
-
-    # ── Final report ─────────────────────────────────────────
-    cube_final, _ = cube.get_world_pose()
-    cube_final = np.asarray(cube_final, dtype=float)
-    err_xy = float(np.linalg.norm(cube_final[:2] - point_b))
-    log(f"Final cube pose: {cube_final.tolist()}")
-    log(f"Place error vs point_b={point_b.tolist()}: {err_xy:.3f} m")
-
-    if ctx.block_state == BlockState.DONE:
-        log(f"SUCCESS: cube delivered to {cube_final.tolist()} "
-            f"(err={err_xy:.3f} m, pick_attempts={ctx.pick_attempts})")
-    elif ctx.block_state == BlockState.FAILED:
-        log(f"FAILED: pick budget exhausted "
-            f"({ctx.pick_attempts}/{ctx.MAX_PICK_ATTEMPTS} attempts)")
-    else:
-        log(f"INCOMPLETE: terminal state={ctx.block_state.value} after {tick + 1} ticks")
+    # ── Aggregate report ────────────────────────────────────
+    n_success = sum(1 for r in results if r["outcome"] == "success")
+    log("=== run_cortex episode summary ===")
+    for r in results:
+        log(f"  ep={r['episode']}: {r['outcome']:<22} "
+            f"err={r['place_error_m']:.3f} m  "
+            f"ticks={r['ticks']:<5} "
+            f"picks={r['pick_attempts']}  "
+            f"a={r['point_a']} b={r['point_b']}")
+    log(f"=== TOTAL: {n_success}/{len(results)} episodes succeeded ===")
 
     await world.pause_async()
     log("run_cortex complete.")
@@ -192,9 +253,9 @@ except Exception as e:
     log(traceback.format_exc())
     raise
 finally:
-    # Defensive — same cleanup pattern as run_pipeline.py. The Cortex
-    # path doesn't install cube_carry_sync, but if a previous run left
-    # one it would override the cube's reset, so clear it here too.
+    # Defensive cleanup — same pattern as run_pipeline.py. The Cortex
+    # path doesn't install cube_carry_sync at the orchestrator level,
+    # but states.py does, and a partial run may have left one alive.
     try:
         from core import state as _state
         if _state.world is not None:

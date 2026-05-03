@@ -91,8 +91,9 @@ task:
   place_tolerance: 0.2
   in_gripper_tolerance: 0.06
 randomization:
-  enabled: false
-  seed: null
+  enabled: true
+  episodes: 3
+  seed: 42
   max_attempts: 100
   min_separation: 0.5
   cube_z: 0.025
@@ -118,4 +119,6 @@ randomization:
   - 4.0
 simulation:
   max_ticks: 50000
+  per_episode_max_ticks: 8000
+  inter_episode_settle_ticks: 60
   physics_dt: null
