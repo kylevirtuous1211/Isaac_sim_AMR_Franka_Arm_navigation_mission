@@ -94,17 +94,40 @@ _STREAM_RE = re.compile(
 )
 
 
+_EP_RE = re.compile(
+    r"ep=(?P<ep>\d+):\s+(?P<outcome>\S+)\s+err=(?P<err>[\d.]+)\s+m\s+ticks=(?P<ticks>\d+)\s+picks=(?P<picks>\d+)"
+)
+_TOTAL_RE = re.compile(r"TOTAL:\s+(?P<n_ok>\d+)/(?P<n_tot>\d+)\s+episodes succeeded")
+
+
 def parse_outcome() -> dict:
-    """Returns a dict of metrics. Missing/unknown values are None."""
+    """Returns a dict of metrics for the LATEST run_cortex.log.
+
+    Tuner now drives a multi-episode randomized loop. The aggregate
+    summary at the end of run_cortex.log is the source of truth:
+
+        TOTAL: K/N episodes succeeded
+
+    Per-episode lines are also parsed so rules can target whichever
+    episode failed first. Stream-based metrics (EE plateau, park
+    distance, manip phase) are scoped to the FIRST FAILED episode in
+    the stream (ep=K_first_fail).
+    """
     metrics = {
-        "outcome": "no_log",
-        "terminal_state": None,
-        "ticks": None,
-        "ee_plateau_z": None,        # min EE z during at_pick/grasp/lift phases
-        "park_dist": None,           # AMR distance to cube at the first need_pick tick
+        "outcome": "no_log",         # success | partial | all_failed | error | unknown
+        "n_success": 0,
+        "n_total": 0,
+        "episodes": [],              # [{ep, outcome, err, ticks, picks}, ...]
+        "first_fail_ep": None,
+        "first_fail_outcome": None,
+        "first_fail_err": None,
+        "first_fail_ticks": None,
+        # Stream-derived metrics for the first failing episode (or any
+        # episode if none failed) — these drive parameter rules.
+        "ee_plateau_z": None,
+        "park_dist": None,
         "phase_timed_out": False,
         "place_err_xy": None,
-        "amr_z_min": None,           # min AMR z (detect wheel-sink)
         "max_ticks_hit": False,
     }
 
@@ -112,58 +135,78 @@ def parse_outcome() -> dict:
         return metrics
     log = LOG_PATH.read_text()
 
-    # Outcome from log
-    if "SUCCESS:" in log:
-        metrics["outcome"] = "success"
-        metrics["terminal_state"] = "done"
-    elif "FAILED: pick budget exhausted" in log:
-        metrics["outcome"] = "pick_failed"
-        metrics["terminal_state"] = "failed"
-    elif "INCOMPLETE:" in log:
-        metrics["outcome"] = "incomplete"
-        metrics["max_ticks_hit"] = True
-    elif "ERROR:" in log:
+    if "ERROR:" in log:
         metrics["outcome"] = "error"
-    else:
-        metrics["outcome"] = "unknown"
 
-    m = re.search(r"Place error \(?XY\)? vs point_b=\[[^\]]+\]: ([\d.]+) m", log)
-    if m:
-        metrics["place_err_xy"] = float(m.group(1))
+    # Episode rows from the summary block.
+    eps = []
+    for em in _EP_RE.finditer(log):
+        d = em.groupdict()
+        eps.append({
+            "ep": int(d["ep"]),
+            "outcome": d["outcome"],
+            "err": float(d["err"]),
+            "ticks": int(d["ticks"]),
+            "picks": int(d["picks"]),
+        })
+    metrics["episodes"] = eps
 
-    m = re.search(r"t (\d+): terminal state", log)
-    if m:
-        metrics["ticks"] = int(m.group(1))
+    tm = _TOTAL_RE.search(log)
+    if tm:
+        n_ok = int(tm.group("n_ok"))
+        n_tot = int(tm.group("n_tot"))
+        metrics["n_success"] = n_ok
+        metrics["n_total"] = n_tot
+        if n_ok == n_tot and n_tot > 0:
+            metrics["outcome"] = "success"
+        elif n_ok > 0:
+            metrics["outcome"] = "partial"
+        elif n_tot > 0:
+            metrics["outcome"] = "all_failed"
+    elif eps:
+        # Per-episode rows present but TOTAL: line missing — run mid-flight.
+        metrics["outcome"] = "in_progress"
 
+    # First failing episode anchors the per-episode rule firing.
+    fail_eps = [e for e in eps if e["outcome"] != "success"]
+    target = fail_eps[0] if fail_eps else (eps[0] if eps else None)
+    if target is not None:
+        metrics["first_fail_ep"] = target["ep"]
+        metrics["first_fail_outcome"] = target["outcome"]
+        metrics["first_fail_err"] = target["err"]
+        metrics["first_fail_ticks"] = target["ticks"]
+        metrics["place_err_xy"] = target["err"]
+        if target["outcome"] == "tick_budget_exhausted":
+            metrics["max_ticks_hit"] = True
+
+    # Phase timeout indicator (anywhere in log) — RMPflow stuck somewhere.
     if "phase '" in log and "timed out" in log:
         metrics["phase_timed_out"] = True
 
-    # Parse stream for EE plateau, park distance, AMR z minimum.
-    if not STREAM_PATH.exists():
-        return metrics
-    pick_zs = []
-    park_dist_first = None
-    amr_zs = []  # we don't currently log amr_z; left as future-proofing
-    cube_xy = None
-    for line in STREAM_PATH.read_text().splitlines():
-        sm = _STREAM_RE.search(line)
-        if not sm:
-            continue
-        d = sm.groupdict()
-        cube_xy = (float(d["cx"]), float(d["cy"]))
-        if d["phase"] in ("at_pick", "grasp", "lift"):
-            pick_zs.append(float(d["ez"]))
-        if d["state"] == "need_pick" and park_dist_first is None:
-            ax, ay = float(d["ax"]), float(d["ay"])
-            cx, cy = float(d["cx"]), float(d["cy"])
-            park_dist_first = ((ax - cx) ** 2 + (ay - cy) ** 2) ** 0.5
+    # Stream — scoped to first failing episode (or all if none failed).
+    if STREAM_PATH.exists():
+        target_ep = metrics["first_fail_ep"] if metrics["first_fail_ep"] is not None else 0
+        ep_prefix = f"ep={target_ep} "
+        pick_zs = []
+        park_dist_first = None
+        for line in STREAM_PATH.read_text().splitlines():
+            if not line.startswith(ep_prefix):
+                continue
+            sm = _STREAM_RE.search(line)
+            if not sm:
+                continue
+            d = sm.groupdict()
+            if d["phase"] in ("at_pick", "grasp", "lift"):
+                pick_zs.append(float(d["ez"]))
+            if d["state"] == "need_pick" and park_dist_first is None:
+                ax, ay = float(d["ax"]), float(d["ay"])
+                cx, cy = float(d["cx"]), float(d["cy"])
+                park_dist_first = ((ax - cx) ** 2 + (ay - cy) ** 2) ** 0.5
 
-    if pick_zs:
-        metrics["ee_plateau_z"] = min(pick_zs)
-    if park_dist_first is not None:
-        metrics["park_dist"] = park_dist_first
-    if amr_zs:
-        metrics["amr_z_min"] = min(amr_zs)
+        if pick_zs:
+            metrics["ee_plateau_z"] = min(pick_zs)
+        if park_dist_first is not None:
+            metrics["park_dist"] = park_dist_first
 
     return metrics
 
@@ -205,7 +248,10 @@ def tune(cfg: dict, m: dict, prev_metrics: Optional[dict] = None) -> tuple[dict,
     )
     if m["ee_plateau_z"] is not None and not plateau_unchanged:
         gap = m["ee_plateau_z"] - cube_z
-        if gap > 0.05 and m["outcome"] in ("pick_failed", "incomplete"):
+        # Multi-episode mode: any failed-or-partial run with a high EE
+        # plateau is a candidate. Specifically include "tick_budget_exhausted"
+        # (the new dominant failure mode for stuck pick / transit).
+        if gap > 0.05 and m["outcome"] in ("partial", "all_failed"):
             cur = float(cfg["manipulator"].get("pick_z_offset", 0.0))
             # Push offset by ~60% of the gap, capped at -0.10 m total
             # (deeper than that puts the target below the floor, which
@@ -221,9 +267,9 @@ def tune(cfg: dict, m: dict, prev_metrics: Optional[dict] = None) -> tuple[dict,
     elif plateau_unchanged and m["outcome"] != "success":
         # ── Rule 1b: pick_z_offset didn't move the EE — kinematic limit.
         # Lower the mount so the Franka base sits closer to the cube,
-        # giving the arm more vertical reach. Mount 0.4 is the empirical
-        # sweet spot in run_pipeline.py (EE descends to z=0.069). Below
-        # that the chassis collision starts to interfere.
+        # giving the arm more vertical reach. Mount ~0.35 is the empirical
+        # sweet spot (EE descends to z≈0.07). Below that the chassis
+        # collision starts to interfere.
         cur = float(cfg["manipulator"].get("mount_local_offset", [0, 0, 0.5])[2])
         # Step down by 0.05 per iteration, floor at 0.35.
         new = _round(max(0.35, cur - 0.05), 3)
@@ -279,7 +325,7 @@ def tune(cfg: dict, m: dict, prev_metrics: Optional[dict] = None) -> tuple[dict,
     # ── Rule 4: place error too high → bump place_z_offset DOWN so the
     # cube is released closer to the marker.
     if (
-        m["outcome"] == "incomplete"
+        m["outcome"] in ("partial", "all_failed")
         and m["place_err_xy"] is not None
         and m["place_err_xy"] > float(cfg["task"].get("place_tolerance", 0.20))
     ):
@@ -333,7 +379,7 @@ def _wait_for_completion(prev_mtime: float, timeout_s: int) -> bool:
     return False
 
 
-def run_pipeline(timeout_s: int = 300) -> tuple[bool, str]:
+def run_cortex_subprocess(timeout_s: int = 300) -> tuple[bool, str]:
     """Send run_cortex.py to Isaac Sim and wait for the log's completion
     marker. Returns (ok, stdout_tail)."""
     prev_mtime = _log_mtime()
@@ -445,7 +491,7 @@ def main() -> int:
                 print("[tune] bootstrap reset failed — bailing")
                 return 1
         t0 = time.time()
-        ok, out = run_pipeline(timeout_s=args.timeout)
+        ok, out = run_cortex_subprocess(timeout_s=args.timeout)
         dt = time.time() - t0
         print(f"[tune] pipeline returned ok={ok} in {dt:.1f}s")
         if not ok:
@@ -453,10 +499,16 @@ def main() -> int:
 
         m = parse_outcome()
         print(f"[tune] metrics: outcome={m['outcome']} "
+              f"({m['n_success']}/{m['n_total']} eps) "
+              f"first_fail_ep={m['first_fail_ep']} "
+              f"first_fail_outcome={m['first_fail_outcome']} "
               f"ee_plateau_z={m['ee_plateau_z']} "
               f"park_dist={m['park_dist']} "
               f"phase_timed_out={m['phase_timed_out']} "
               f"place_err_xy={m['place_err_xy']}")
+        for e in m["episodes"]:
+            print(f"[tune]   ep={e['ep']} {e['outcome']:<22} "
+                  f"err={e['err']:.3f} ticks={e['ticks']} picks={e['picks']}")
 
         archive_iteration(i)
 

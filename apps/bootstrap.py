@@ -1,7 +1,7 @@
 # ============================================================
 # apps/bootstrap.py — load hospital + spawn robots ONCE
 #
-# Subsequent scripts (apps/run_nav.py, apps/run_manip.py, ...) import
+# Subsequent scripts (apps/run_cortex.py, tests/scripts/*) import
 # from core.state and skip the 60–180s hospital reload.
 #
 # Idempotent: re-running this script is a no-op if core.state is populated.
@@ -132,17 +132,6 @@ try:
     #   prior script did.
     # ──────────────────────────────────────────────────────────
     def _reset_to_start_poses(world, cfg) -> None:
-        # Defensive: remove any cube_carry_sync callback left over from a
-        # prior run_pipeline. If it's still alive, it teleports the cube
-        # to the gripper EE every tick and would override the cube reset
-        # below — making the cube appear "stuck" in the gripper after a
-        # fast-reset.
-        for cb_name in ("cube_carry_sync",):
-            try:
-                world.remove_physics_callback(cb_name)
-            except Exception:
-                pass
-
         nav_cfg = cfg["navigator"]["robot"]
         amr_pos = np.array(nav_cfg.get("start_position", [0.0, 0.0, 0.0]),
                            dtype=float)

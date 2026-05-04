@@ -28,21 +28,15 @@ from isaacsim.cortex.framework.df import (
 from .context import BlockState, MobileManipContext
 from .states import (
     BumpRetryState,
-    DisablePoseSyncState,
     DoneAction,
-    EnablePoseSyncState,
     FailAction,
     ManipPickState,
+    ManipPlaceState,
     ManipResetState,
     ManipWaitDoneState,
     NavSetGoalState,
     NavStopState,
     OpenGripperState,
-    RebaseFrankaToAmrState,
-    RemoveCubeCarrySyncState,
-    ReregisterCarrySyncState,
-    SettleState,
-    install_cube_carry_sync,
 )
 
 
@@ -81,68 +75,50 @@ def _build_nav_to_block() -> DfStateMachineDecider:
 
 
 def _build_pick_rlds() -> DfStateMachineDecider:
-    """Pick RLDS — analogous to make_pick_rlds() in
-    block_stacking_behavior. We open the gripper (via ManipReset),
-    teleport Franka above the AMR, arm the FSM with the cube's live
-    pose, and poll for done/failed.
+    """Pick RLDS — open gripper, send RMPflow to the cube, poll until
+    the FSM reports done or failed.
 
-    On failure, ManipWaitDoneState transitions into BumpRetryAction
+    On failure (RMPflow timeout OR SurfaceGripper.gripped() empty at
+    phase=done), ManipWaitDoneState transitions into BumpRetryState
     which increments ctx.pick_attempts. The sequence terminates;
     Dispatch reroutes on the next tick (back to pick_rlds for a retry,
-    or to fail if the budget is exhausted)."""
+    or to fail if the budget is exhausted).
+    """
     bump_retry = BumpRetryState()
     return _AutoRestartingStateMachineDecider(DfStateSequence([
         ManipResetState(),
-        DisablePoseSyncState(),
-        RebaseFrankaToAmrState(),
-        SettleState(ticks=30),
         ManipPickState(),
-        # Install cube_carry_sync at phase=lift — by then the gripper
-        # has finished closing (40 ticks of grasp_hold) and the EE has
-        # plateaued near the cube (~0.082 m vs cube_z=0.026, ~5 cm
-        # away). The teleport jump is therefore ~5 cm rather than
-        # the ~15 cm we'd see if installed at phase=done after the
-        # arm lifts. SurfaceGripper.close() also fires at the FSM
-        # level (see core/manipulator.py); if its D6 joint engages,
-        # the kinematic teleport is redundant but harmless.
-        ManipWaitDoneState(
-            on_failure=bump_retry,
-            fail_label="pick",
-            on_phase_entry={"lift": install_cube_carry_sync},
-        ),
+        ManipWaitDoneState(on_failure=bump_retry, fail_label="pick"),
     ]))
 
 
 def _build_transit() -> DfStateMachineDecider:
+    """Transit — drive the AMR to point_b standoff. The Franka is
+    held by the FixedJoint mount (mount_mode=fixed_joint), and the
+    arm sits in the manipulator FSM's `carry` phase actively tracking
+    a stow pose above the AMR via RMPflow."""
     return _AutoRestartingStateMachineDecider(DfStateSequence([
-        EnablePoseSyncState(),
-        # Re-register carry_sync after pose-sync so PhysX fires it
-        # last each tick (otherwise carry_sync teleports cube to OLD
-        # EE pose, then pose-sync moves the Franka, leaving cube 1
-        # frame behind).
-        ReregisterCarrySyncState(),
         NavSetGoalState(goal_fn_name="b_standoff_xy"),
         NavStopState(),
     ]))
 
 
 def _build_place_rlds() -> DfStateMachineDecider:
-    """Place RLDS — drop-style place.
+    """Place RLDS — descend to point_b, open gripper, cube falls.
 
-    The cube is currently teleported to the EE by carry_sync at lift-
-    final height (~0.176 m). Removing carry_sync at place entry lets
-    gravity deposit it on point_b. SurfaceGripper.open() in the
-    OpenGripperState path is a belt-and-braces release in case the
-    SG D6 joint engaged.
+    With the SurfaceGripper holding the cube physically (no
+    cube_carry_sync teleport), opening the SG releases the D6 joint
+    and the cube falls under gravity. The parallel gripper opens at
+    the same time, spreading the fingers.
+
+    OpenGripperState is belt-and-braces: ManipPlace's at_place→release
+    transition already calls gripper.open(), but calling it again here
+    is idempotent and ensures release even if the FSM bailed early.
     """
     return _AutoRestartingStateMachineDecider(DfStateSequence([
-        DisablePoseSyncState(),
-        RebaseFrankaToAmrState(),
-        SettleState(ticks=10),
-        RemoveCubeCarrySyncState(),
-        SettleState(ticks=60),
+        ManipPlaceState(),
+        ManipWaitDoneState(fail_label="place", treat_failure_as_done=True),
         OpenGripperState(),
-        SettleState(ticks=20),
     ]))
 
 

@@ -54,25 +54,20 @@ manipulator:
   - 0.0
   - 0.0
   - 0.35
-  # mount_mode controls how the Franka rides on the AMR:
-  #   pose_sync   — per-tick callback teleports Franka to chassis + offset.
-  #                 Decoupled physics (Franka mass doesn't load wheels).
-  #   fixed_joint — UsdPhysics.FixedJoint with excludeFromArticulation.
-  #                 Real PhysX coupling: arm mass loads wheels, reaction
-  #                 torques propagate. Authored by apps/bootstrap.py.
   mount_mode: fixed_joint
   mount_sync_name: franka_base_sync
   clearance_height: 0.15
+  carry_height: 0.55
   approach_tolerance: 0.07
   grasp_hold_ticks: 40
   release_hold_ticks: 30
-  phase_timeout_ticks: 800
+  phase_timeout_ticks: 1200
   pick_z_offset: -0.1
-  place_z_offset: 0.1
+  place_z_offset: 0.05
   rmpflow_config: /workspace/configs/rmpflow/franka_rmpflow_common.yaml
   rmpflow: {}
   surface_gripper:
-    max_grip_distance: 0.15
+    max_grip_distance: 0.03
     coaxial_force_limit: 50.0
     shear_force_limit: 50.0
     retry_interval: 1.0
@@ -104,19 +99,19 @@ randomization:
   - 1.0
   goal_bounds:
   - 3.0
-  - 7.0
-  - 1.0
-  - 5.0
+  - 6.0
+  - 0.5
+  - 2.5
   cube_bounds:
   - 1.5
-  - 3.0
+  - 3.5
   - 0.5
-  - 2.0
+  - 2.5
   place_bounds:
-  - 4.0
-  - 6.0
-  - 2.0
-  - 4.0
+  - 3.5
+  - 5.5
+  - 0.5
+  - 2.5
 simulation:
   max_ticks: 50000
   per_episode_max_ticks: 8000

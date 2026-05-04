@@ -21,7 +21,7 @@ Usage
         state.navigator = build_navigator(...)
         ...
 
-    # In apps/run_nav.py:
+    # In apps/run_cortex.py:
     from core import state
     state.require_ready()
     navigator = state.navigator
@@ -47,9 +47,9 @@ config: Optional[dict] = None             # parsed config.yaml
 extras: dict[str, Any] = {}               # any other per-run handles
 
 # Monotonic counter — bumped by bootstrap / reset / teardown. Long-running
-# app loops (e.g. run_nav.py) should capture this at start and exit if it
-# ever changes, which lets us abort stale background loops without killing
-# the whole Kit process.
+# app loops (e.g. run_cortex.py) should capture this at start and exit if
+# it ever changes, which lets us abort stale background loops without
+# killing the whole Kit process.
 nav_generation: int = 0
 
 

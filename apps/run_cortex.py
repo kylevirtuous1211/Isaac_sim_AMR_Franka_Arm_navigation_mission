@@ -53,7 +53,7 @@ try:
     manipulator = state.manipulator
     planner = state.planner
 
-    # ── Hot-apply tunables (mirrors run_pipeline.py) ─────────
+    # ── Hot-apply tunables ───────────────────────────────────
     nav_cfg = CFG["navigator"]
     navigator._reach_tol = float(nav_cfg.get("waypoint_reach_threshold", 0.5))
     navigator._stuck_limit = int(nav_cfg.get("stuck_threshold_ticks", 240))
@@ -91,8 +91,11 @@ try:
 
     # ── Episode helpers ──────────────────────────────────────
     def _clean_callbacks():
-        for name in ("run_nav_step", "run_manip_step", "nav_step", "manip_step",
-                     "cube_carry_sync"):
+        # The cortex pipeline doesn't install per-tick physics callbacks
+        # under named keys (it drives via the main loop), but a partial
+        # in-process run from a prior orchestrator may have left some
+        # alive. Defensive cleanup.
+        for name in ("nav_step", "manip_step"):
             try:
                 world.remove_physics_callback(name)
             except Exception:
@@ -125,9 +128,9 @@ try:
         # a partial in-process run may have left some live.
         _clean_callbacks()
 
-        # Pose-sync must be ON before nav_to_block. The nav sub-decider
-        # never enables it, so a prior crash that left it off would make
-        # the AMR drive away from a stationary Franka.
+        # Idempotent mount enforcement: in fixed_joint mode this clears
+        # any stale pose_sync callback; in pose_sync mode it re-installs
+        # the per-tick teleport.
         manipulator.ensure_mount_sync(world)
 
         ctx = MobileManipContext(navigator, manipulator, cube,
@@ -199,7 +202,17 @@ try:
     await world.play_async()
     results = []
 
+    # Capture the nav_generation we started with. If something else
+    # (force_reboot, a new bootstrap) bumps it during our run, we abort
+    # the OUTER loop too — without this guard, the per-episode reset
+    # would race with whatever script just took over the world and we'd
+    # produce interleaved log spam.
+    outer_my_gen = getattr(state, "nav_generation", 0)
+
     for ep_idx in range(n_episodes):
+        if getattr(state, "nav_generation", 0) != outer_my_gen:
+            log(f"--- nav_generation bumped before ep {ep_idx} — aborting outer loop ---")
+            break
         log(f"--- Episode {ep_idx + 1}/{n_episodes} ---")
 
         if randomizer is not None:
@@ -252,13 +265,3 @@ except Exception as e:
     log(f"ERROR: {type(e).__name__}: {e}")
     log(traceback.format_exc())
     raise
-finally:
-    # Defensive cleanup — same pattern as run_pipeline.py. The Cortex
-    # path doesn't install cube_carry_sync at the orchestrator level,
-    # but states.py does, and a partial run may have left one alive.
-    try:
-        from core import state as _state
-        if _state.world is not None:
-            _state.world.remove_physics_callback("cube_carry_sync")
-    except Exception:
-        pass

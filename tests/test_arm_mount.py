@@ -50,7 +50,8 @@ def test_franka_sits_above_amr_at_start(ensure_bootstrap):
 def test_franka_follows_amr_after_driving(ensure_bootstrap):
     """After the AMR drives somewhere, Franka must still be directly
     above it. This is the real mobile-manipulation contract — the
-    pose-sync callback tracks the chassis every tick."""
+    FixedJoint between chassis_link and panda_link0 keeps the arm
+    locked to the AMR (mount_mode=fixed_joint)."""
     # Reset first so we start from a known state
     sync_to_container("apps/bootstrap.py")
     run_in_isaac("apps/bootstrap.py", timeout=60.0)

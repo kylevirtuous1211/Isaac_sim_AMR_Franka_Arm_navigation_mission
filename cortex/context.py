@@ -11,8 +11,7 @@ Responsibilities:
     transit-time slips (the spec asks for separate retry budgets per
     pick session — a slipped cube doesn't burn the retry budget).
   - Provide standoff math helpers (cube_park_xy, b_standoff_xy,
-    place_target_b) that mirror run_pipeline.py exactly so behavior
-    is identical when the happy path runs.
+    place_target_b) for the navigator goals + manipulator targets.
 """
 from __future__ import annotations
 
@@ -82,14 +81,6 @@ class MobileManipContext(DfRobotApiContext):
             float(nav_cfg.get("waypoint_reach_threshold", 0.25)) + 0.05
         )
         self.place_z_offset = float(manip_cfg.get("place_z_offset", 0.10))
-
-        # Mount/sync names — reused by states.py to disable/enable pose-sync.
-        self.mount_to = manip_cfg.get("mount_to")
-        self.mount_sync_name = manip_cfg.get("mount_sync_name", "franka_base_sync")
-        self.mount_local_offset = np.array(
-            manip_cfg.get("mount_local_offset", [0.0, 0.0, 0.50]),
-            dtype=float,
-        )
 
         self.reset()
 
@@ -215,11 +206,11 @@ class MobileManipContext(DfRobotApiContext):
         (0.25 m) handles the parking offset. We deliberately do NOT
         apply place_standoff here: that's a place-side adjustment so
         the arm has reach over the marker B without driving onto it.
-        For pick, the cube is the goal, and run_pipeline.py confirms
-        this works (AMR parks ~0.22 m from cube and the Franka can
-        descend to z≈0.07 — close enough to grasp). With a 0.40 m
-        standoff the AMR ends up ~0.47 m from the cube and the Franka
-        plateaus 12 cm above the cube due to its reach envelope."""
+        For pick, the cube is the goal: the AMR parks ~0.22 m from the
+        cube and the Franka can descend to z≈0.07 — close enough to
+        grasp. With a 0.40 m standoff the AMR ends up ~0.47 m from the
+        cube and the Franka plateaus 12 cm above the cube due to its
+        reach envelope."""
         target_xy = (
             self._cube_pos_at_dispatch
             if self._cube_pos_at_dispatch is not None
@@ -240,8 +231,7 @@ class MobileManipContext(DfRobotApiContext):
         return self.point_b.copy()
 
     def place_target_b(self) -> np.ndarray:
-        """Drop pose at point_b — XY at B, Z = cube_half + place_z_offset.
-        Mirrors run_pipeline.py:356."""
+        """Drop pose at point_b — XY at B, Z = cube_half + place_z_offset."""
         return np.array(
             [self.point_b[0], self.point_b[1],
              self.cube_half + self.place_z_offset],

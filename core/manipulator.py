@@ -174,7 +174,7 @@ class FrankaRMPflowManipulator(Manipulator):
     Each phase drives RMPflow toward a target XYZ; obstacle field is shared.
     """
 
-    _PHASES = ["idle", "above_pick", "at_pick", "grasp", "lift",
+    _PHASES = ["idle", "above_pick", "at_pick", "grasp", "lift", "carry",
                "above_place", "at_place", "release", "retract", "done"]
 
     def __init__(self):
@@ -190,6 +190,7 @@ class FrankaRMPflowManipulator(Manipulator):
 
         # Tunables (loaded from cfg in setup)
         self._clearance_height = 0.15
+        self._carry_height = 0.55
         self._approach_tol = 0.03
         self._grasp_hold_ticks = 40
         self._release_hold_ticks = 30
@@ -228,6 +229,7 @@ class FrankaRMPflowManipulator(Manipulator):
         self.articulation_ctrl = ArticulationMotionPolicy(self.franka, self.rmp)
 
         self._clearance_height = float(cfg.get("clearance_height", 0.15))
+        self._carry_height = float(cfg.get("carry_height", 0.55))
         self._approach_tol = float(cfg.get("approach_tolerance", 0.03))
         self._grasp_hold_ticks = int(cfg.get("grasp_hold_ticks", 40))
         self._release_hold_ticks = int(cfg.get("release_hold_ticks", 30))
@@ -336,7 +338,8 @@ class FrankaRMPflowManipulator(Manipulator):
         # Phase-level timeout: if we've spent more than N ticks in the same
         # phase without advancing, something is stuck (RMPflow target
         # unreachable, base pose stale, gripper fight, etc.) — bail out.
-        if self._tick_in_phase > self._phase_timeout_ticks:
+        # Carry is the long-lived stow phase during transit — never times out.
+        if self._phase != "carry" and self._tick_in_phase > self._phase_timeout_ticks:
             print(f"[FrankaRMPflow] phase '{self._phase}' timed out after "
                   f"{self._tick_in_phase} ticks (dist_to_target={dist:.3f})")
             self._phase = "failed"
@@ -386,10 +389,10 @@ class FrankaRMPflowManipulator(Manipulator):
         """Re-install the pose-sync callback if `mount_to` is configured
         AND `mount_mode == "pose_sync"`.
 
-        `setup()` installs it once on first bootstrap, but scripts like
-        `run_manip.py` may remove it mid-session, and `bootstrap.py`'s
-        fast-reset path doesn't re-run `setup()`. Calling this after each
-        reset makes the mount state idempotent regardless of workflow.
+        `setup()` installs it once on first bootstrap, but the
+        `bootstrap.py` fast-reset path doesn't re-run `setup()`. Calling
+        this after each reset makes the mount state idempotent regardless
+        of workflow.
 
         In `mount_mode == "fixed_joint"` this is a no-op (the FixedJoint
         is authored from bootstrap and persists in USD across resets).
@@ -427,6 +430,15 @@ class FrankaRMPflowManipulator(Manipulator):
             return self._target_pick
         if self._phase == "lift":
             return self._target_pick + up if self._target_pick is not None else None
+        if self._phase == "carry":
+            # Stow pose tracking the AMR — recomputed each tick so the
+            # arm follows the chassis as it drives. Without mount_to,
+            # there's nothing to track; fall back to the lift target.
+            mount_to = self.cfg.get("mount_to")
+            if mount_to:
+                mount_pos, _ = _amr_mount_pose(mount_to)
+                return mount_pos + np.array([0.0, 0.0, self._carry_height])
+            return self._target_pick + up if self._target_pick is not None else None
         if self._phase == "above_place":
             return self._target_place + up if self._target_place is not None else None
         if self._phase in ("at_place", "release"):
@@ -458,10 +470,12 @@ class FrankaRMPflowManipulator(Manipulator):
         elif self._phase == "grasp" and self._tick_in_phase >= self._grasp_hold_ticks:
             self._phase, self._tick_in_phase = "lift", 0
         elif self._phase == "lift" and dist < self._approach_tol:
-            if self._target_place is not None:
-                self._phase, self._tick_in_phase = "above_place", 0
-            else:
-                self._phase, self._tick_in_phase = "done", 0
+            # Always go to carry after a successful lift — the cortex
+            # network polls for phase=carry as pick-success and the
+            # carry phase actively holds the stow pose during transit.
+            # ManipPlaceState forces phase=idle then calls place(),
+            # which sets above_place and starts the descend.
+            self._phase, self._tick_in_phase = "carry", 0
         elif self._phase == "above_place" and dist < self._approach_tol:
             self._phase, self._tick_in_phase = "at_place", 0
         elif self._phase == "at_place" and dist < self._approach_tol:

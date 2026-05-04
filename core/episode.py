@@ -10,9 +10,6 @@ the bootstrap fast-reset converge on the same end state.
 Notes:
   - The occupancy grid is built from static hospital geometry only, so
     moving the cube / AMR start does not invalidate planner.is_valid().
-  - `_cube_carry_sync` is removed defensively before any teleport: if a
-    prior episode terminated with the cube glued to the EE, the callback
-    would override our cube spawn on the next physics tick.
 """
 from __future__ import annotations
 
@@ -53,14 +50,6 @@ def reset_world_for_episode(world, cfg: dict, manipulator, navigator) -> None:
     bootstrap version still exists for the cold-start / fast-reset
     paths; this version is for steady-state per-episode resets.
     """
-    # Drop any cube_carry_sync left from a prior episode — otherwise it
-    # teleports the cube to the gripper EE on the next physics tick and
-    # the cube reset below has no observable effect.
-    try:
-        world.remove_physics_callback("cube_carry_sync")
-    except Exception:
-        pass
-
     nav_cfg = cfg["navigator"]["robot"]
     amr_pos = np.array(nav_cfg.get("start_position", [0.0, 0.0, 0.0]),
                        dtype=float)
