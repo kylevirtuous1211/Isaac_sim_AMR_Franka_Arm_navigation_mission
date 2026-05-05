@@ -248,23 +248,28 @@ try:
         state.nav_generation = getattr(state, "nav_generation", 0) + 1
 
         world = state.world
-        await world.reset_async()
-        state.manipulator.reset()
-        # Force AMR + Franka + cube back to their configured start poses.
-        # Don't rely on world.reset_async alone: it only restores spawn
-        # defaults, which may not be fully applied. _reset_to_start_poses
-        # also clears the navigator's _reached_latch.
-        _reset_to_start_poses(world, CFG)
-        # Re-apply the Franka↔chassis collision filter — idempotent,
-        # but needed because previous bootstraps may not have done it
-        # (the API was added later).
+        # Re-apply USD-level mount/articulation attributes BEFORE
+        # world.reset_async(). PhysX caches physxArticulation:fixedBase
+        # and joint excludeFromArticulation when it parses the
+        # articulation; modifying them after reset_async() does not
+        # propagate. Authoring before reset guarantees the next
+        # initialize_simulation reads the current values.
         _apply_franka_chassis_collision_filter(CFG, log)
-        # Re-author the SurfaceGripper — also idempotent, also added
-        # later than the original full-bootstrap path.
         _author_surface_gripper(CFG, log)
-        # Re-author the chassis↔panda_link0 FixedJoint when mount_mode is
-        # set to "fixed_joint". No-op otherwise. Idempotent.
         _author_fixed_joint_mount(CFG, log)
+
+        await world.reset_async()
+        # Pause physics around the multi-body teleport. With mount_mode=
+        # fixed_joint and rootJoint disabled, the FixedJoint between
+        # chassis_link and panda_link0 is the ONLY constraint holding
+        # them together. Any PhysX tick where Carter and Franka aren't
+        # at the correct relative offset triggers an infinite-stiffness
+        # impulse from the FixedJoint and the broadphase NaNs out.
+        # Pausing guarantees both set_world_pose calls land before the
+        # next tick.
+        await world.pause_async()
+        state.manipulator.reset()
+        _reset_to_start_poses(world, CFG)
         # Re-install the mount pose-sync callback if the manipulator is
         # configured for mobile manip. Safe to call unconditionally — it's
         # a no-op when mount_to isn't set or when mount_mode=fixed_joint,
@@ -368,12 +373,16 @@ try:
         # ── 5. Reset & play; then finalize articulation-dependent state
         # Order matters on first boot: play before manipulator.reset (the
         # gripper joint handles aren't live until the articulation is
-        # playing). Then force the canonical start poses so this match
-        # exactly what fast-reset produces.
+        # playing). Then PAUSE around the teleport — with mount_mode=
+        # fixed_joint and rootJoint disabled, any tick where Carter and
+        # Franka aren't aligned causes the FixedJoint to apply a huge
+        # impulse and the broadphase NaNs out.
         await world.reset_async()
         await world.play_async()
         state.manipulator.reset()                  # open gripper (needs live articulation)
+        await world.pause_async()
         _reset_to_start_poses(world, CFG)
+        await world.play_async()
         state.manipulator.ensure_mount_sync(world)
         log("World reset & playing.")
 

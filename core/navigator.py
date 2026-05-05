@@ -21,6 +21,7 @@ from isaacsim.robot.wheeled_robots.controllers.differential_controller import (
 from isaacsim.storage.native import get_assets_root_path
 
 from .planner import Planner
+from .diag import diag, diag_throttled
 
 
 class NavStatus(Enum):
@@ -121,8 +122,10 @@ class WaypointNavigator(Navigator):
     # ── goal / plan ──────────────────────────────────────────
     def set_goal(self, xy) -> None:
         if self.planner is None or self.robot is None:
+            diag(f"[nav.set_goal] FAIL: planner={self.planner} robot={self.robot}")
             raise RuntimeError("Navigator.setup() not called")
 
+        diag(f"[nav.set_goal] called with xy={list(map(float, np.asarray(xy)[:2]))}")
         self._goal = np.asarray(xy, dtype=float)[:2]
         start = self.get_pose()[0][:2]
         self._waypoints = self.planner.plan(start, self._goal)
@@ -132,6 +135,8 @@ class WaypointNavigator(Navigator):
         self._reached_latch = False
         self.ctrl.reset()
 
+        diag(f"[nav.set_goal] start={start.tolist()} goal={self._goal.tolist()} "
+             f"waypoints={len(self._waypoints)}")
         if not self._waypoints:
             print(f"[Navigator] no path from {start.tolist()} to {self._goal.tolist()}")
         else:
@@ -140,8 +145,11 @@ class WaypointNavigator(Navigator):
     # ── per-tick step ────────────────────────────────────────
     def step(self) -> NavStatus:
         if self._goal is None:
+            diag_throttled("step:goal_none", "step early-exit: _goal is None → RUNNING (no driving)")
             return NavStatus.RUNNING
         if not self._waypoints:
+            diag_throttled("step:no_waypoints",
+                           f"step early-exit: empty waypoints, _goal={self._goal.tolist()} → FAILED")
             return NavStatus.FAILED
 
         pos, ori = self.get_pose()
@@ -152,6 +160,8 @@ class WaypointNavigator(Navigator):
         # controller — without this, any drift past reach_tol flips us back
         # to RUNNING and the AMR orbits the goal forever.
         if self._reached_latch:
+            diag_throttled("step:latched",
+                           f"step early-exit: _reached_latch=True at pos={pos_xy.tolist()} → REACHED")
             self._zero_wheels()
             return NavStatus.REACHED
 
@@ -203,17 +213,25 @@ class WaypointNavigator(Navigator):
         articulation is initialized (which happens on world.reset())."""
         if self._wheel_indices is not None:
             return
+        all_names = list(self.robot.dof_names or [])
+        diag(f"[nav._ensure_wheel_indices] dof_names ({len(all_names)}): {all_names}")
+        diag(f"[nav._ensure_wheel_indices] configured wheel_dof_names: {self._wheel_dof_names}")
         idx = getattr(self.robot, "_wheel_dof_indices", None)
         if idx:
             self._wheel_indices = list(idx)
+            diag(f"[nav._ensure_wheel_indices] using robot._wheel_dof_indices: {self._wheel_indices}")
+            for i in self._wheel_indices:
+                if 0 <= i < len(all_names):
+                    diag(f"[nav._ensure_wheel_indices]   index {i} -> {all_names[i]}")
         else:
-            all_names = list(self.robot.dof_names or [])
             self._wheel_indices = [all_names.index(n) for n in self._wheel_dof_names]
+            diag(f"[nav._ensure_wheel_indices] resolved by name lookup: {self._wheel_indices}")
         print(f"[Navigator] wheel DOF indices = {self._wheel_indices}")
 
     def _apply_wheel_action(self, action) -> None:
         """Safely apply a DifferentialController action to just the wheel DOFs."""
         if action is None or getattr(action, "joint_velocities", None) is None:
+            diag_throttled("apply:none", "apply_wheel_action: action None or no joint_velocities")
             return
         self._ensure_wheel_indices()
         action.joint_indices = np.array(self._wheel_indices, dtype=np.int32)
@@ -225,10 +243,25 @@ class WaypointNavigator(Navigator):
             print(f"[Navigator] tick {self._dbg_n}: action.joint_velocities="
                   f"{np.asarray(action.joint_velocities).tolist()} "
                   f"joint_indices={action.joint_indices.tolist()}")
+        diag_throttled("apply:ok",
+                       f"apply_wheel_action vel={np.asarray(action.joint_velocities).tolist()} "
+                       f"idx={action.joint_indices.tolist()}")
         self.robot.apply_action(action)
+        # Post-apply chassis-velocity probe: if the wheels are commanded
+        # but the chassis isn't moving, the articulation root is anchored.
+        try:
+            _pos, _ori = self.robot.get_world_pose()
+            _lv = np.asarray(self.robot.get_linear_velocity()).tolist()
+            _av = np.asarray(self.robot.get_angular_velocity()).tolist()
+            _jv = np.asarray(self.robot.get_joint_velocities()).tolist()
+            diag_throttled("apply:body_state",
+                           f"chassis xyz={np.asarray(_pos).tolist()} "
+                           f"lin_vel={_lv} ang_vel={_av} joint_vel={_jv}")
+        except Exception as _e:
+            diag_throttled("apply:body_state_err", f"body-state probe failed: {_e}")
 
     def _handle_blockage(self) -> NavStatus:
-        if self._replans_used >= self._max_replans:
+        if self._rreplans_used >= self._max_replans:
             print("[Navigator] stuck and out of replans — FAILED")
             return NavStatus.FAILED
         self._replans_used += 1

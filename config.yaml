@@ -54,7 +54,7 @@ manipulator:
   - 0.0
   - 0.0
   - 0.35
-  mount_mode: fixed_joint
+  mount_mode: pose_sync
   mount_sync_name: franka_base_sync
   clearance_height: 0.15
   carry_height: 0.55

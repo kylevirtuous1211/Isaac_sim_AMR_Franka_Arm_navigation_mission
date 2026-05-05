@@ -39,10 +39,59 @@ try:
     import omni.kit.app
 
     from core import state
+    from core.diag import diag, truncate as diag_truncate
     from core.episode import apply_episode_to_cfg, reset_world_for_episode
     from core.randomizer import Randomizer
     from cortex.context import BlockState, MobileManipContext
     from cortex.network import make_decider_network
+
+    diag_truncate()
+    diag("=== run_cortex started — diag stream truncated ===")
+
+    # ── Mount/articulation attribute probe ───────────────────────
+    # The chassis-jam bug fires when /World/Franka has fixedBase=True or
+    # the mount FixedJoint is missing excludeFromArticulation=True.
+    # Surface the live values so we can rule that out quickly.
+    try:
+        import omni.usd
+        from pxr import UsdPhysics
+        _stage = omni.usd.get_context().get_stage()
+        _franka_root = "/World/Franka"
+        _franka_prim = _stage.GetPrimAtPath(_franka_root)
+        _fb = _franka_prim.GetAttribute("physxArticulation:fixedBase") if _franka_prim and _franka_prim.IsValid() else None
+        _fb_val = _fb.Get() if _fb and _fb.IsValid() else "<missing>"
+        diag(f"[probe] {_franka_root} physxArticulation:fixedBase = {_fb_val}  (must be False or wheels jam)")
+
+        _joint_path = "/World/Franka/franka_mount"
+        _joint_prim = _stage.GetPrimAtPath(_joint_path)
+        if _joint_prim and _joint_prim.IsValid():
+            _exa = _joint_prim.GetAttribute("physics:excludeFromArticulation")
+            _exa_val = _exa.Get() if _exa and _exa.IsValid() else "<missing>"
+            _b0 = _joint_prim.GetRelationship("physics:body0").GetTargets() if _joint_prim.GetRelationship("physics:body0") else []
+            _b1 = _joint_prim.GetRelationship("physics:body1").GetTargets() if _joint_prim.GetRelationship("physics:body1") else []
+            diag(f"[probe] {_joint_path} excludeFromArticulation = {_exa_val} body0={list(map(str, _b0))} body1={list(map(str, _b1))}")
+        else:
+            diag(f"[probe] {_joint_path} prim not found (mount_mode may be pose_sync)")
+
+        # Check for ANY UsdPhysics joint anywhere under /World/Franka or /World/NovaCarter
+        # that could be pinning the chassis. Wider net than just franka_mount.
+        try:
+            for _p in _stage.Traverse():
+                _path_str = str(_p.GetPath())
+                if not (_path_str.startswith("/World/Franka")
+                        or _path_str.startswith("/World/NovaCarter")):
+                    continue
+                if (_p.IsA(UsdPhysics.Joint) or _p.IsA(UsdPhysics.FixedJoint)
+                        or _p.IsA(UsdPhysics.RevoluteJoint)
+                        or _p.IsA(UsdPhysics.PrismaticJoint)):
+                    _b0 = _p.GetRelationship("physics:body0").GetTargets() if _p.GetRelationship("physics:body0") else []
+                    _b1 = _p.GetRelationship("physics:body1").GetTargets() if _p.GetRelationship("physics:body1") else []
+                    diag(f"[probe joint] {_path_str} type={_p.GetTypeName()} "
+                         f"body0={list(map(str, _b0))} body1={list(map(str, _b1))}")
+        except Exception as _je:
+            diag(f"[probe joints] failed: {type(_je).__name__}: {_je}")
+    except Exception as _probe_e:
+        diag(f"[probe] failed: {type(_probe_e).__name__}: {_probe_e}")
 
     state.require_ready()
     log(state.summary())
@@ -152,7 +201,12 @@ try:
             ctx.last_manip_status = manipulator.step()
             ctx.last_nav_status = navigator.step()
             ctx.update_block_state()
-            network.step()
+            try:
+                network.step()
+            except Exception as _net_e:
+                diag(f"[run_cortex] network.step() RAISED at tick {tick}: "
+                     f"{type(_net_e).__name__}: {_net_e}")
+                raise
 
             if ctx.block_state != last_state_logged:
                 cp, _ = cube.get_world_pose()
@@ -220,7 +274,14 @@ try:
             log(f"  sampled: start={ep.start_xy.tolist()} "
                 f"cube={ep.cube_xyz.tolist()} place={ep.place_xyz.tolist()}")
             apply_episode_to_cfg(CFG, ep)
+            # Pause around the multi-body teleport — with mount_mode=
+            # fixed_joint and rootJoint disabled, the FixedJoint between
+            # chassis_link and panda_link0 is the only constraint holding
+            # them together. Any PhysX tick where they're not at the
+            # correct relative offset triggers a huge impulse and NaN.
+            await world.pause_async()
             reset_world_for_episode(world, CFG, manipulator, navigator)
+            await world.play_async()
             await _settle(settle_ticks)
 
         task = CFG["task"]

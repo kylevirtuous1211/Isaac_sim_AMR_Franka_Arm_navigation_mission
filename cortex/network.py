@@ -25,6 +25,15 @@ from isaacsim.cortex.framework.df import (
     DfStateSequence,
 )
 
+try:
+    from core.diag import diag, diag_throttled
+except Exception:
+    def diag(_msg):
+        pass
+
+    def diag_throttled(_k, _m, every=100):
+        pass
+
 from .context import BlockState, MobileManipContext
 from .states import (
     BumpRetryState,
@@ -57,6 +66,7 @@ class _AutoRestartingStateMachineDecider(DfStateMachineDecider):
 
     def decide(self):
         if self.state is None and self.init_state is not None:
+            diag(f"[AutoRestart] re-entering init_state for {type(self).__name__}")
             self.state = self.init_state
             self._bind_state()
             self.state.enter()
@@ -140,6 +150,7 @@ class Dispatch(DfDecider):
 
     def decide(self) -> DfDecision:
         s = self.context.block_state
+        diag_throttled("dispatch:decide", f"Dispatch.decide block_state={s.value if s else 'None'}")
         if s == BlockState.FAILED:
             return DfDecision("fail")
         if s == BlockState.DONE:

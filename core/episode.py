@@ -99,6 +99,26 @@ def reset_world_for_episode(world, cfg: dict, manipulator, navigator) -> None:
             manipulator.franka.set_angular_velocity(np.zeros(3))
         except Exception:
             pass
+        # Verification probe: with fixedBase=False and rootJoint disabled the
+        # Franka is a free-floating articulation, and set_world_pose has been
+        # observed to silently fail in some Isaac Sim versions for that case.
+        # If the read-back pose differs from the requested pose by more than
+        # 1mm, the FixedJoint will be massively violated when world.play()
+        # resumes and PhysX will explode the broadphase.
+        try:
+            from core.diag import diag
+            _got_pos, _ = manipulator.franka.get_world_pose()
+            _got_pos = np.asarray(_got_pos, dtype=float)
+            _err = float(np.linalg.norm(_got_pos - np.asarray(franka_pos)))
+            diag(f"[reset_world_for_episode] franka teleport: "
+                 f"requested={franka_pos.tolist()} got={_got_pos.tolist()} "
+                 f"err={_err:.6f} m")
+        except Exception as _e:
+            try:
+                from core.diag import diag
+                diag(f"[reset_world_for_episode] franka teleport probe failed: {_e}")
+            except Exception:
+                pass
         manipulator.reset()  # opens gripper, resets phase
 
     # Cube — spawned at point_a, resting on the floor (z = cube_half).

@@ -19,6 +19,12 @@ from isaacsim.cortex.framework.df import DfAction, DfState
 from core.manipulator import ManipStatus
 from core.navigator import NavStatus
 
+try:
+    from core.diag import diag
+except Exception:  # core.diag absent in older bootstraps — fall back silently
+    def diag(_msg):  # noqa: D401
+        pass
+
 
 # ────────────────────────────────────────────────────────────────
 # Navigator wrappers
@@ -42,16 +48,33 @@ class NavSetGoalState(DfState):
 
     def enter(self):
         import numpy as np
+        diag(f"[NavSetGoalState.enter] FIRED for goal_fn_name={self.goal_fn_name!r}")
         ctx = self.context
-        goal_fn = getattr(ctx, self.goal_fn_name)
+        diag(f"[NavSetGoalState.enter] ctx={type(ctx).__name__} "
+             f"has_navigator={hasattr(ctx, 'navigator')}")
+        try:
+            goal_fn = getattr(ctx, self.goal_fn_name)
+        except Exception as e:
+            diag(f"[NavSetGoalState.enter] getattr FAILED: {type(e).__name__}: {e}")
+            raise
         # b_standoff_xy needs the current AMR xy.
         try:
-            goal = goal_fn()
-        except TypeError:
-            amr_pos, _ = ctx.navigator.get_pose()
-            goal = goal_fn(np.asarray(amr_pos, dtype=float)[:2])
+            try:
+                goal = goal_fn()
+            except TypeError:
+                amr_pos, _ = ctx.navigator.get_pose()
+                goal = goal_fn(np.asarray(amr_pos, dtype=float)[:2])
+        except Exception as e:
+            diag(f"[NavSetGoalState.enter] goal_fn() FAILED: {type(e).__name__}: {e}")
+            raise
+        diag(f"[NavSetGoalState.enter] computed goal={goal.tolist()}")
         print(f"[cortex] NavSetGoal({self.goal_fn_name}) -> {goal.tolist()}")
-        ctx.navigator.set_goal(goal)
+        try:
+            ctx.navigator.set_goal(goal)
+        except Exception as e:
+            diag(f"[NavSetGoalState.enter] set_goal FAILED: {type(e).__name__}: {e}")
+            raise
+        diag(f"[NavSetGoalState.enter] set_goal returned OK")
 
     def step(self):
         ctx = self.context
@@ -72,6 +95,7 @@ class NavStopState(DfState):
     """One-shot: latch navigator REACHED + zero wheels."""
 
     def enter(self):
+        diag("[NavStopState.enter] FIRED — calling navigator.stop()")
         self.context.navigator.stop()
 
     def step(self):
